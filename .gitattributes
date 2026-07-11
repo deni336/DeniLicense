@@ -1,2 +1,3 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Detect text files and keep source/build inputs byte-stable across platforms.
+* text=auto eol=lf
+*.sql text eol=lf

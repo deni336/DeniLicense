@@ -1,0 +1,81 @@
+name: denilicense
+
+services:
+  postgres:
+    image: postgres:17.10-alpine3.23@sha256:8189a1f6e40904781fc9e2612687877791d21679866db58b1de996b31fc312e4
+    environment:
+      POSTGRES_DB: denilicense
+      POSTGRES_USER: denilicense
+      POSTGRES_PASSWORD: denilicense-development-only
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U denilicense -d denilicense"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  activation-key-init:
+    build: .
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        test -f /var/lib/denilicense/secrets/activation.key.json ||
+        /usr/local/bin/denilic keygen --purpose activation
+        --private /var/lib/denilicense/secrets/activation.key.json
+        --public /var/lib/denilicense/secrets/activation.public.json
+    environment:
+      DENILICENSE_KEY_PASSPHRASE: denilicense-development-activation-passphrase
+    volumes:
+      - dev-secrets:/var/lib/denilicense/secrets
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: "no"
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      activation-key-init:
+        condition: service_completed_successfully
+    environment:
+      DENILICENSE_ENV: development
+      DENILICENSE_HTTP_ADDRESS: :8080
+      DENILICENSE_DATABASE_URL: postgres://denilicense:denilicense-development-only@postgres:5432/denilicense?sslmode=disable
+      # Predictable development values. Replace every secret outside local Compose.
+      DENILICENSE_TOKEN_PEPPER: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      DENILICENSE_DEVICE_PEPPER: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
+      DENILICENSE_ISSUANCE_PEPPER: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI
+      DENILICENSE_REGISTRATION_MODE: open
+      DENILICENSE_EXPOSE_DEV_TOKENS: "true"
+      DENILICENSE_ALLOWED_ORIGINS: http://localhost:3000
+      DENILICENSE_ACTIVATION_ISSUER: http://127.0.0.1:8080
+      DENILICENSE_ACTIVATION_KEY_FILE: /var/lib/denilicense/secrets/activation.key.json
+      DENILICENSE_ACTIVATION_KEY_PASSPHRASE: denilicense-development-activation-passphrase
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - dev-secrets:/var/lib/denilicense/secrets:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+volumes:
+  postgres-data:
+  dev-secrets:

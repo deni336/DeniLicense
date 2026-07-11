@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17.10-alpine3.23@sha256:8189a1f6e40904781fc9e2612687877791d21679866db58b1de996b31fc312e4
+        env:
+          POSTGRES_DB: denilicense
+          POSTGRES_USER: denilicense
+          POSTGRES_PASSWORD: integration-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U denilicense -d denilicense"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DENILICENSE_ENV: test
+      DENILICENSE_HTTP_ADDRESS: 127.0.0.1:8080
+      DENILICENSE_DATABASE_URL: postgres://denilicense:integration-password@127.0.0.1:5432/denilicense?sslmode=disable
+      DENILICENSE_TOKEN_PEPPER: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      DENILICENSE_DEVICE_PEPPER: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
+      DENILICENSE_ISSUANCE_PEPPER: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI
+      DENILICENSE_REGISTRATION_MODE: open
+      DENILICENSE_EXPOSE_DEV_TOKENS: 'true'
+      DENILICENSE_ACTIVATION_ISSUER: http://127.0.0.1:8080
+      DENILICENSE_ACTIVATION_KEY_FILE: /tmp/denilicense/activation.key.json
+      DENILICENSE_ACTIVATION_KEY_PASSPHRASE: integration-activation-passphrase
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - run: go mod download
+      - run: gofmt -l . | tee /tmp/gofmt-files && test ! -s /tmp/gofmt-files
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Reachable vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: Build binaries
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -o /tmp/denilicense-server ./cmd/denilicense
+          go build -trimpath -o /tmp/denilic ./cmd/denilic
+      - name: Build release container
+        run: |
+          docker compose config --quiet
+          docker build --tag denilicense-ci .
+      - name: Generate test signer and bootstrap owner
+        env:
+          DENILICENSE_KEY_PASSPHRASE: integration-activation-passphrase
+          DENILICENSE_BOOTSTRAP_PASSWORD: correct horse battery staple
+        run: |
+          mkdir -p /tmp/denilicense
+          /tmp/denilic keygen --purpose activation \
+            --private /tmp/denilicense/activation.key.json \
+            --public /tmp/denilicense/activation.public.json
+          /tmp/denilic keygen --purpose license \
+            --private /tmp/denilicense/offline.key.json \
+            --public /tmp/denilicense/offline.public.json
+          /tmp/denilic issue \
+            --key /tmp/denilicense/offline.key.json \
+            --issuer ci.example.offline \
+            --product CI_PRODUCT \
+            --subject ci-customer \
+            --valid-for 24h \
+            --out /tmp/denilicense/offline.dlicense
+          /tmp/denilic verify \
+            --public /tmp/denilicense/offline.public.json \
+            --artifact /tmp/denilicense/offline.dlicense \
+            --issuer ci.example.offline \
+            --product CI_PRODUCT
+          /tmp/denilicense-server bootstrap-owner --email owner@example.com
+      - name: Start service
+        run: |
+          /tmp/denilicense-server serve >/tmp/denilicense-server.log 2>&1 &
+          echo $! >/tmp/denilicense-server.pid
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:8080/ready && exit 0
+            sleep 1
+          done
+          cat /tmp/denilicense-server.log
+          exit 1
+      - name: PostgreSQL end-to-end flow
+        env:
+          DENILICENSE_INTEGRATION_URL: http://127.0.0.1:8080
+          DENILICENSE_INTEGRATION_ISSUER: http://127.0.0.1:8080
+          DENILICENSE_INTEGRATION_OWNER_EMAIL: owner@example.com
+          DENILICENSE_INTEGRATION_OWNER_PASSWORD: correct horse battery staple
+        run: go test -v ./integration
+      - name: Stop service
+        if: always()
+        run: |
+          test ! -f /tmp/denilicense-server.pid || kill "$(cat /tmp/denilicense-server.pid)" || true
+          test ! -f /tmp/denilicense-server.log || tail -200 /tmp/denilicense-server.log

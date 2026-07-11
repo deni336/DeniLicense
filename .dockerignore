@@ -1,0 +1,11 @@
+.git
+.github
+bin
+coverage
+data
+secrets
+.env*
+*.dlicense
+*.dlic
+*.key.json
+README.md
