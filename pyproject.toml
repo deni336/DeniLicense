@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "denilicense"
+version = "0.1.0"
+description = "First-party authentication and offline/online software licensing service"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{name = "deni336"}]
+dependencies = [
+  "argon2-cffi==25.1.0",
+  "cryptography==49.0.0",
+  "fastapi==0.139.0",
+  "httpx==0.28.1",
+  "psycopg[binary,pool]==3.3.4",
+  "PyYAML==6.0.3",
+  "uvicorn==0.51.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pip-audit==2.10.1",
+  "pytest==9.1.1",
+  "ruff==0.15.21",
+]
+
+[project.scripts]
+denilicense = "denilicense.cli:main"
+denilic = "denilicense.offline_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+denilicense = ["migrations/*.sql", "ui/*", "ui/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-config --strict-markers --import-mode=importlib"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "ASYNC", "C4", "SIM", "RUF"]
+ignore = ["S101"]

@@ -1,42 +1,47 @@
-# Go build outputs
-/bin/
-/dist/
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
 
-# Test, benchmark, fuzz, and profiling artifacts
-/coverage/
-coverage.out
-*.coverprofile
+# Virtual environments and local interpreters
+.venv/
+venv/
+env/
+.python-version
+
+# Packaging and build outputs
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Coverage, profiling, and test artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage/
 *.prof
-**/testdata/fuzz/*
-!**/testdata/fuzz/.gitkeep
-
-# Go workspaces and local module state
-go.work
-go.work.sum
-/vendor/
 
 # Local configuration and secrets
 .env
 .env.*
 !.env.example
-/secrets/
+secrets/
 *.key.json
 
-# Generated license artifacts contain credentials or signed grants
+# Generated license artifacts
 *.dlicense
 *.dlic
 *.dlim
 *.dreq
 
 # Local runtime data
-/data/
+data/
 
 # Editors and operating systems
 .idea/

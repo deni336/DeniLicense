@@ -1,40 +1,120 @@
 # Operations guide
 
+## Development containers
+
+The included Compose stack builds the Python 3.14 image, starts PostgreSQL 17, creates a development activation key in a named volume, applies migrations on API startup, and binds both services to loopback ports.
+
+```powershell
+docker compose up --build -d --wait
+docker compose ps
+Invoke-RestMethod http://127.0.0.1:8080/ready
+docker compose logs api
+```
+
+Create the first owner after the stack is healthy:
+
+```powershell
+docker compose run --rm api bootstrap-owner --email owner@example.com
+```
+
+Stop the containers with `docker compose down`. Add `--volumes` only when you intentionally want to destroy the development database and generated activation key.
+
+The Compose credentials, peppers, key passphrase, HTTP listener, and database TLS setting are intentionally unsafe outside local development.
+
 ## Required production configuration
 
-- `DENILICENSE_ENV=production`
-- PostgreSQL URL with `sslmode=verify-full` and a least-privilege application role
-- independent 32-byte-or-longer base64url token, device, and issuance peppers
-- activation issuer plus encrypted activation key, with passphrase delivered through a root-readable secret file
-- explicit CORS origins
-- HTTPS public-app and authenticated HTTPS email-webhook URLs for verification and password recovery
+At minimum, set:
 
-Configuration parsing is fail-closed: malformed booleans/durations, short secrets, wildcard production CORS, HTTP production email URLs, and exposed development tokens stop startup.
+- `DENILICENSE_ENV=production`.
+- `DENILICENSE_DATABASE_URL` with exactly one `sslmode=verify-full` query parameter and a least-privilege role.
+- Independent unpadded base64url values of at least 32 decoded bytes for `DENILICENSE_TOKEN_PEPPER`, `DENILICENSE_DEVICE_PEPPER`, and `DENILICENSE_ISSUANCE_PEPPER`.
+- `DENILICENSE_ACTIVATION_ISSUER`, `DENILICENSE_ACTIVATION_KEY_FILE`, and a root-readable `DENILICENSE_ACTIVATION_KEY_PASSPHRASE_FILE`.
+- Explicit HTTPS origins in `DENILICENSE_ALLOWED_ORIGINS` for browser clients,
+  including the exact origin that serves the embedded `/ui/` console.
+- HTTPS `DENILICENSE_PUBLIC_APP_URL` and `DENILICENSE_EMAIL_WEBHOOK_URL`, plus a webhook bearer value of at least 32 characters.
+- `DENILICENSE_AUTO_MIGRATE=false` for a serving role that should not issue DDL.
 
-Run `denilicense migrate` as a deployment job with a TLS-verified PostgreSQL URL and a role allowed to change the schema. Production defaults `DENILICENSE_AUTO_MIGRATE` to false; the serving role then verifies the exact migration ledger at startup without issuing DDL. Grant the runtime role only the table/sequence operations it needs.
+The configuration parser fails closed. Malformed booleans or durations, short secrets, wildcard or HTTP production origins, an HTTP production webhook, missing recovery email delivery, and unverified production database TLS stop startup.
 
-Configure `DENILICENSE_TRUSTED_PROXY_CIDRS` only for reverse proxies that overwrite client forwarding headers. Forwarded addresses from all other peers are ignored.
+`DENILICENSE_PASSWORD_PEPPER` is optional but, when set, must also be unpadded base64url encoding at least 32 bytes. Rotating it requires a deliberate password-rehash strategy.
+
+Set `DENILICENSE_REGISTRATION_MODE` to `open` or `closed`. Open registration requires a working email webhook, except when development token exposure is explicitly enabled outside production. In either mode, a platform owner can invite an account from the embedded console without assigning a shared temporary password. The invitee chooses their own password with a short-lived, single-use setup token.
+
+## Schema migration
+
+Run migration as a separate deployment job with a PostgreSQL role permitted to modify the schema:
+
+```powershell
+$env:DENILICENSE_ENV = 'production'
+$env:DENILICENSE_DATABASE_URL = 'postgresql://migration-role@db.example/denilicense?sslmode=verify-full'
+denilicense migrate
+```
+
+Migrations are embedded in the Python package, serialized with a PostgreSQL advisory lock, and recorded with filenames and SHA-256 checksums. The server verifies the exact migration ledger when automatic migration is disabled and refuses to start on missing, unknown, or modified migrations.
+
+Grant the runtime role only the table and sequence operations it needs. Run one migration job before rolling out new service instances.
+
+## Network and proxy configuration
+
+Serve DeniLicense behind an HTTPS reverse proxy or load balancer. The Python process listens at `DENILICENSE_HTTP_ADDRESS`; it does not terminate production TLS itself.
+
+Configure `DENILICENSE_TRUSTED_PROXY_CIDRS` only with networks belonging to reverse proxies that overwrite `X-Forwarded-For`. Forwarded addresses from untrusted peers are ignored. A bad forwarded chain from a trusted peer falls back to the direct peer rather than trusting arbitrary input.
+
+The application adds request IDs, restrictive browser security headers, and HSTS in production. Preserve `X-Request-ID` in log aggregation and return it to support staff with problem responses.
+
+Use `/live` only for process liveness. `/ready` checks the database and is the appropriate readiness probe. The public JWK set and generated OpenAPI document are available at:
+
+- `/.well-known/denilicense-activation-keys.json`
+- `/openapi.yaml`
 
 ## Key lifecycle
 
-Use unrelated offline and online keys. The service publishes the current signing key plus every public document in `DENILICENSE_ACTIVATION_VERIFICATION_KEY_FILES`. Before rotation, add the successor public key there and allow clients to fetch the expanded JWK set. Then switch the signer while retaining the prior public key until every lease it signed has expired. Move private signing behind a KMS/HSM adapter for high-value deployments. A revoked offline issuer is terminal; retroactively revoking all licenses from that issuer is intentionally a separate policy decision.
+Use unrelated keys for offline license issuance and online activation signing.
 
-Back up public trust metadata, the database, and the online key configuration independently. Test restoration. Do not back up the offline issuer into the online environment.
+Generate an online key in a protected administrative environment:
 
-Treat `DENILICENSE_ISSUANCE_PEPPER` as recovery-critical key material. Online issuance uses it to reproduce the same serial and one-time claim code for an idempotent retry without storing the plaintext code. Losing or rotating it in place prevents exact recovery of those responses and can turn a replay into a conflicting or duplicate business operation. Store it in a versioned secret manager, include it in encrypted recovery tests, and introduce an explicit versioned migration before any future rotation.
+```powershell
+denilic keygen --purpose activation `
+  --private secrets/activation.key.json `
+  --public secrets/activation.public.json
+```
 
-## Monitoring
+In production, pass the encrypted private document through `DENILICENSE_ACTIVATION_KEY_FILE` and deliver its passphrase through a separately mounted, root-readable file. The current file-backed signer should be replaced by a KMS/HSM adapter for high-value deployments.
 
-Alert on repeated authentication/redeem failures, refresh-token reuse, conflicting offline serial imports, issuer changes, owner/role changes, unusual issuance volume or term, license revocation, and signer/readiness failure. Export structured logs and `audit_events` to storage that database administrators cannot rewrite.
+For rotation, add successor or retained public documents to the comma-separated `DENILICENSE_ACTIVATION_VERIFICATION_KEY_FILES`. Publish the expanded JWK set before switching signers. Keep the previous public key available until every lease it signed has expired. At most 32 additional verification keys are accepted.
 
-Email webhook jobs are held in a bounded in-memory queue, retried three times, and drained on graceful shutdown so auth responses remain non-enumerating and independent of provider latency. Alert on delivery failures and queue saturation. This queue is not durable across a process/host crash; users can request a fresh token, but deployments requiring guaranteed delivery should replace it with an encrypted transactional outbox or a durable provider queue before launch.
+An offline issuer can move from active to retired or revoked. Revocation is terminal for that key; it prevents future imports but does not silently rewrite the state of licenses already imported. Make retroactive license policy explicit.
 
-Platform owners and auditors can read the bounded audit API at
-`GET /api/v1/admin/audit-events`; use `beforeId` for descending pagination.
-User role and status changes revoke that user's sessions and cannot remove the
-final active platform owner. Maintain at least two independently controlled
-owner accounts for recovery.
+Back up public trust metadata, the database, the online key configuration, and recovery instructions independently. Never copy the offline issuer private key into the online environment.
 
-## Multi-instance deployments
+## Recovery-critical issuance pepper
 
-PostgreSQL remains authoritative and transactional invariants work across replicas. The built-in token-bucket limiter is per-process; enforce account and source limits at a shared edge/Redis layer. Keep server clocks synchronized. Run schema migration once under the included PostgreSQL advisory lock before rolling out new binaries.
+Online issuance derives its deterministic serial and one-time claim-code response from `DENILICENSE_ISSUANCE_PEPPER`, the administrator identity, and the idempotency key. This supports exact retry recovery without storing the plaintext code.
+
+Treat that pepper as non-rotating recovery key material for the current derivation version. Losing or changing it in place prevents exact recovery of previous idempotent responses and can turn a retry into a duplicate or conflicting business operation. Store it in a versioned secret manager, include it in encrypted recovery tests, and design an explicit versioned migration before rotation.
+
+## Email delivery
+
+Verification, password-reset, and owner-created account-setup jobs enter a bounded in-memory queue with 256 slots and two worker threads. Delivery uses a ten-second HTTP timeout, rejects redirects, retries three times with short backoff, and drains until `DENILICENSE_SHUTDOWN_TIMEOUT` during graceful shutdown.
+
+This keeps authentication responses non-enumerating and independent of provider latency, but it is not durable across process or host failure. Users can request fresh tokens. Deployments requiring guaranteed delivery should use an encrypted transactional outbox or durable provider queue before launch. Alert on queue saturation and final delivery failures without logging raw tokens.
+
+## Monitoring and audit
+
+Alert on repeated authentication and claim failures, refresh-token reuse, conflicting offline serial imports, issuer changes, owner or role changes, unusual issuance volume or terms, license revocation, email delivery failure, migration mismatch, database readiness failure, and signer failure.
+
+Export application logs and `audit_events` to storage that application and database administrators cannot rewrite. Platform owners and auditors can page backward through `GET /api/v1/admin/audit-events` with the descending `beforeId` cursor and filters. User creation and access changes are audited. Role or status changes revoke that user's sessions, cannot modify the acting owner's own access, and cannot remove the final active platform owner. Maintain at least two independently controlled owner accounts.
+
+The maintenance thread removes expired session, refresh-token, email-token, password-reset-token, and activation-challenge rows in bounded batches each hour. PostgreSQL remains the authoritative security state.
+
+## Multiple service instances
+
+Database locks and transactions preserve claim, seat, renewal, final-owner, and idempotency invariants across replicas. Server clocks must remain synchronized.
+
+The built-in token-bucket limiter is process-local. Enforce account and source limits at a shared edge or shared data store before scaling horizontally. Coordinate activation-key configuration across instances, publish all valid verification keys, and perform migration once before the rollout.
+
+## Backup and incident preparation
+
+Test encrypted database restoration, issuance-pepper recovery, activation-key recovery and rotation, owner-account recovery, and offline public-key inventory. Define RPO/RTO and rehearse response to database compromise, activation-signer compromise, offline-issuer loss, and refresh-token reuse alerts.
+
+A database restore and an activation-key restore are separate concerns. Preserve previous activation public keys long enough to verify outstanding leases, while never restoring a compromised private key into service.

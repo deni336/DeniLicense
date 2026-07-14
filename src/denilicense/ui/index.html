@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#102a43">
+  <title>DeniLicense Console</title>
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+
+  <main id="login-screen" class="login-screen" aria-labelledby="login-title">
+    <section class="login-brand" aria-label="DeniLicense">
+      <div class="brand-mark large" aria-hidden="true">DL</div>
+      <p class="eyebrow">License operations</p>
+      <h1>Know every license.<br>Know every machine.</h1>
+      <p class="login-copy">Issue, import, assign, and monitor software licenses from one secure operations console.</p>
+      <div class="trust-list" aria-label="Platform capabilities">
+        <span>Offline issuance</span>
+        <span>Machine tracking</span>
+        <span>Complete audit trail</span>
+      </div>
+    </section>
+
+    <section class="login-panel">
+      <div class="login-card">
+        <p class="eyebrow">DeniLicense Console</p>
+        <h2 id="login-title">Welcome back</h2>
+        <p class="muted">Sign in with your DeniLicense account.</p>
+        <div id="login-error" class="alert error" role="alert" hidden></div>
+        <form id="login-form" class="stack-form">
+          <label>Email address
+            <input id="login-email" name="email" type="email" autocomplete="username" maxlength="254" required autofocus>
+          </label>
+          <label>Password
+            <input id="login-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+          </label>
+          <button class="button primary wide" type="submit">
+            <span class="button-label">Sign in</span>
+            <span class="button-spinner" aria-hidden="true"></span>
+          </button>
+        </form>
+        <button id="request-password-reset-button" class="text-button password-help" type="button">Forgot or need to set your password?</button>
+        <p class="login-footnote">Tokens remain in this browser tab and are removed when the tab closes.</p>
+      </div>
+    </section>
+  </main>
+
+  <main id="password-setup-screen" class="login-screen" aria-labelledby="password-setup-title" hidden>
+    <section class="login-brand" aria-label="DeniLicense">
+      <div class="brand-mark large" aria-hidden="true">DL</div>
+      <p class="eyebrow">Secure account setup</p>
+      <h1>Choose your password.<br>Protect your access.</h1>
+      <p class="login-copy">Complete your DeniLicense invitation with a unique password that you do not use anywhere else.</p>
+      <div class="trust-list" aria-label="Password guidance"><span>15+ characters</span><span>Unique password</span><span>One-time setup link</span></div>
+    </section>
+    <section class="login-panel">
+      <div class="login-card">
+        <div id="password-setup-entry">
+          <p class="eyebrow">Account invitation</p>
+          <h2 id="password-setup-title">Set your password</h2>
+          <p class="muted">This setup link can be used once. Choose a password with at least 15 characters.</p>
+          <div id="password-setup-error" class="alert error" role="alert" hidden></div>
+          <form id="password-setup-form" class="stack-form">
+            <label>New password<input name="newPassword" type="password" autocomplete="new-password" minlength="15" maxlength="1024" required autofocus></label>
+            <label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="15" maxlength="1024" required></label>
+            <button class="button primary wide" type="submit"><span class="button-label">Set password</span><span class="button-spinner" aria-hidden="true"></span></button>
+          </form>
+          <button id="password-setup-return" class="text-button password-help" type="button">Return to sign in</button>
+          <p class="login-footnote">The invitation token was removed from the address bar and is never stored by this console.</p>
+        </div>
+        <div id="password-setup-complete" hidden>
+          <p class="eyebrow">Account ready</p><h2>Password saved</h2><p class="muted">You can now sign in with your email address and new password.</p>
+          <button id="password-setup-continue" class="button primary wide" type="button">Continue to sign in</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="app-shell" class="app-shell" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="Primary navigation">
+      <div class="sidebar-brand">
+        <div class="brand-mark" aria-hidden="true">DL</div>
+        <div><strong>DeniLicense</strong><small>Operations console</small></div>
+      </div>
+      <nav id="primary-nav" class="primary-nav">
+        <button type="button" data-route="dashboard"><span aria-hidden="true">⌂</span>Overview</button>
+        <button type="button" data-route="licenses"><span aria-hidden="true">◇</span>Licenses</button>
+        <button type="button" data-route="machines" data-roles="platform_owner,license_admin,support,auditor"><span aria-hidden="true">▣</span>Machines</button>
+        <button type="button" data-route="products" data-roles="platform_owner,license_admin"><span aria-hidden="true">▦</span>Products</button>
+        <button type="button" data-route="issuers" data-roles="platform_owner"><span aria-hidden="true">⌁</span>Issuers</button>
+        <button type="button" data-route="users" data-roles="platform_owner"><span aria-hidden="true">◎</span>Users</button>
+        <button type="button" data-route="audit" data-roles="platform_owner,auditor"><span aria-hidden="true">≡</span>Audit log</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="system-indicator" class="health-dot" aria-hidden="true"></span>
+        <span><strong>API status</strong><small id="system-status">Checking…</small></span>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button id="menu-toggle" class="icon-button menu-toggle" type="button" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <div>
+          <p id="page-kicker" class="eyebrow">Operations</p>
+          <h1 id="page-title">Overview</h1>
+        </div>
+        <div class="topbar-actions">
+          <div class="user-chip">
+            <span id="user-avatar" class="avatar" aria-hidden="true"></span>
+            <span><strong id="user-email"></strong><small id="user-role"></small></span>
+          </div>
+          <button id="logout-button" class="button ghost" type="button">Sign out</button>
+        </div>
+      </header>
+
+      <main id="main-content" class="content" tabindex="-1">
+        <section id="view-dashboard" class="view" data-view="dashboard" aria-labelledby="dashboard-heading">
+          <div class="view-heading">
+            <div><p class="eyebrow">At a glance</p><h2 id="dashboard-heading">License overview</h2><p class="muted">Current inventory and allocation across your products.</p></div>
+            <button id="dashboard-refresh" class="button secondary" type="button">Refresh</button>
+          </div>
+          <div id="dashboard-error" class="alert error" role="alert" hidden></div>
+          <div id="metric-grid" class="metric-grid" aria-live="polite"></div>
+          <div class="dashboard-grid">
+            <article class="panel">
+              <div class="panel-heading"><div><p class="eyebrow">Inventory</p><h3>Licenses by state</h3></div></div>
+              <div id="state-breakdown" class="breakdown"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-heading"><div><p class="eyebrow">Attention</p><h3>Expiring soon</h3></div><button class="text-button" type="button" data-go="licenses">View all</button></div>
+              <div id="expiring-list" class="compact-list"></div>
+            </article>
+          </div>
+          <article class="panel recent-panel">
+            <div class="panel-heading"><div><p class="eyebrow">Recent inventory</p><h3>Latest licenses</h3></div><button class="text-button" type="button" data-go="licenses">Manage licenses</button></div>
+            <div id="recent-licenses" class="table-wrap"></div>
+          </article>
+        </section>
+
+        <section id="view-licenses" class="view" data-view="licenses" aria-labelledby="licenses-heading" hidden>
+          <div class="view-heading">
+            <div><p class="eyebrow">Inventory</p><h2 id="licenses-heading">Licenses</h2><p class="muted">Find licenses, inspect machines, and manage lifecycle state.</p></div>
+            <div id="license-actions" class="action-row">
+              <button id="import-license-button" class="button secondary" type="button">Import offline license</button>
+              <button id="create-license-button" class="button primary" type="button">Issue license</button>
+            </div>
+          </div>
+          <form id="license-filters" class="filter-bar" aria-label="License filters">
+            <label>Serial<input name="serial" type="search" placeholder="UUID" autocomplete="off"></label>
+            <label>Owner email<input name="licenseOwnerSearch" data-api-param="ownerEmail" type="search" placeholder="owner@example.com" autocomplete="one-time-code"></label>
+            <label>Claim suffix<input name="claimCodeSuffix" type="search" placeholder="AB12" maxlength="4" autocomplete="off"></label>
+            <label>Product<select name="productCode"><option value="">All products</option></select></label>
+            <label>State<select name="state"><option value="">All states</option><option value="active">Active</option><option value="suspended">Suspended</option><option value="revoked">Revoked</option></select></label>
+            <button class="button secondary" type="submit">Apply filters</button>
+            <button id="clear-license-filters" class="text-button" type="button">Clear</button>
+          </form>
+          <div id="licenses-error" class="alert error" role="alert" hidden></div>
+          <div class="panel table-panel">
+            <div id="license-result-summary" class="table-summary" aria-live="polite"></div>
+            <div id="licenses-table" class="table-wrap"></div>
+          </div>
+        </section>
+
+        <section id="view-products" class="view" data-view="products" aria-labelledby="products-heading" hidden>
+          <div class="view-heading">
+            <div><p class="eyebrow">Catalog</p><h2 id="products-heading">Products</h2><p class="muted">Products define the audience for issued and imported licenses.</p></div>
+            <button id="create-product-button" class="button primary" type="button">New product</button>
+          </div>
+          <div id="products-error" class="alert error" role="alert" hidden></div>
+          <div class="panel table-panel"><div id="products-table" class="table-wrap"></div></div>
+        </section>
+
+        <section id="view-machines" class="view" data-view="machines" aria-labelledby="machines-heading" hidden>
+          <div class="view-heading">
+            <div><p class="eyebrow">Installations</p><h2 id="machines-heading">Machines</h2><p class="muted">Track every activation and the license, product, and owner it belongs to. Device keys are pseudonymous installation identifiers, not physical hardware fingerprints.</p></div>
+            <button id="machines-refresh" class="button secondary" type="button">Refresh</button>
+          </div>
+          <form id="machine-filters" class="filter-bar" aria-label="Machine filters">
+            <label>Owner email<input name="machineOwnerSearch" data-api-param="ownerEmail" type="search" placeholder="owner@example.com" autocomplete="one-time-code"></label>
+            <label>Product<select name="productCode"><option value="">All products</option></select></label>
+            <label>Machine label<input name="label" type="search" placeholder="Workstation or server"></label>
+            <label>State<select name="state"><option value="">All states</option><option value="active">Active</option><option value="deactivated">Deactivated</option></select></label>
+            <button class="button secondary" type="submit">Apply filters</button>
+            <button id="clear-machine-filters" class="text-button" type="button">Clear</button>
+          </form>
+          <div id="machines-error" class="alert error" role="alert" hidden></div>
+          <div class="panel table-panel">
+            <div id="machine-result-summary" class="table-summary" aria-live="polite"></div>
+            <div id="machines-table" class="table-wrap"></div>
+          </div>
+        </section>
+
+        <section id="view-issuers" class="view" data-view="issuers" aria-labelledby="issuers-heading" hidden>
+          <div class="view-heading">
+            <div><p class="eyebrow">Trust store</p><h2 id="issuers-heading">Offline issuers</h2><p class="muted">Register Ed25519 public keys used to authenticate offline license artifacts.</p></div>
+          </div>
+          <div class="two-column">
+            <article class="panel padded">
+              <p class="eyebrow">Add trust</p><h3>Register issuer key</h3>
+              <form id="issuer-form" class="stack-form">
+                <label>Issuer identifier<input name="issuer" required maxlength="256" placeholder="com.example.licensing"></label>
+                <label>Public key document<textarea name="publicKeyDocument" required maxlength="16384" rows="7" spellcheck="false" placeholder="Paste the denilic public key document"></textarea></label>
+                <div class="form-grid">
+                  <label>Valid from <input name="notBefore" type="datetime-local"></label>
+                  <label>Valid until <input name="notAfter" type="datetime-local"></label>
+                </div>
+                <button class="button primary" type="submit">Register issuer</button>
+              </form>
+            </article>
+            <article class="panel padded">
+              <p class="eyebrow">Lifecycle</p><h3>Update issuer status</h3>
+              <p class="muted">Retire a key to stop new imports, or revoke it when its private material may be compromised.</p>
+              <form id="issuer-status-form" class="stack-form">
+                <label>Key ID<input name="keyId" required minlength="43" maxlength="43" spellcheck="false"></label>
+                <label>Status<select name="status"><option value="active">Active</option><option value="retired">Retired</option><option value="revoked">Revoked</option></select></label>
+                <button class="button danger-outline" type="submit">Update status</button>
+              </form>
+              <div id="issuer-result" class="result-card" hidden></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-users" class="view" data-view="users" aria-labelledby="users-heading" hidden>
+          <div class="view-heading">
+            <div><p class="eyebrow">Access control</p><h2 id="users-heading">Users</h2><p class="muted">Create accounts and assign least-privilege access with audited role changes.</p></div>
+            <div class="action-row"><button id="create-user-button" class="button primary" type="button">Add user</button></div>
+          </div>
+          <section class="panel access-guide" aria-labelledby="access-guide-heading">
+            <div class="panel-heading"><div><h3 id="access-guide-heading">Permission bundles</h3><p class="muted">Permissions are managed through roles so each account receives a consistent, reviewable access policy.</p></div></div>
+            <div id="role-guide" class="role-guide" aria-label="Role permission summary"></div>
+          </section>
+          <form id="user-search" class="filter-bar compact" aria-label="User search">
+            <label>Email<input name="userEmailSearch" type="search" placeholder="Search exact email" autocomplete="one-time-code"></label>
+            <button class="button secondary" type="submit">Search</button>
+            <button id="clear-user-search" class="text-button" type="button">Clear</button>
+          </form>
+          <div id="users-error" class="alert error" role="alert" hidden></div>
+          <div class="panel table-panel"><div id="users-table" class="table-wrap"></div></div>
+        </section>
+
+        <section id="view-audit" class="view" data-view="audit" aria-labelledby="audit-heading" hidden>
+          <div class="view-heading"><div><p class="eyebrow">Accountability</p><h2 id="audit-heading">Audit log</h2><p class="muted">Review security-sensitive activity with immutable event context.</p></div></div>
+          <form id="audit-filters" class="filter-bar" aria-label="Audit filters">
+            <label>Action<input name="action" type="search" placeholder="license.create_online"></label>
+            <label>Target type<input name="targetType" type="search" placeholder="license"></label>
+            <label>Target ID<input name="targetId" type="search" placeholder="UUID or key"></label>
+            <label>Actor user ID<input name="actorUserId" type="search" placeholder="UUID"></label>
+            <button class="button secondary" type="submit">Apply filters</button>
+            <button id="clear-audit-filters" class="text-button" type="button">Clear</button>
+          </form>
+          <div id="audit-error" class="alert error" role="alert" hidden></div>
+          <div class="panel table-panel">
+            <div id="audit-table" class="table-wrap"></div>
+            <div class="load-more"><button id="audit-more" class="button secondary" type="button" hidden>Load older events</button></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="detail-drawer" class="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true" tabindex="-1" inert>
+    <header class="drawer-header"><div><p id="drawer-kicker" class="eyebrow">Details</p><h2 id="drawer-title">License</h2></div><button id="drawer-close" class="icon-button" type="button" aria-label="Close details">×</button></header>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+
+  <dialog id="license-dialog" class="modal">
+    <form id="license-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Online issuance</p><h2>Issue a license</h2></div><button class="icon-button" type="button" data-close-dialog="license-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form">
+        <div id="license-form-error" class="alert error" role="alert" hidden></div>
+        <div class="form-grid">
+          <label>Product<select name="productCode" required></select></label>
+          <label>Subject<input name="subject" maxlength="320" placeholder="Customer or contract reference"></label>
+          <label>Machine seats<input name="maxActivations" type="number" required min="1" max="100000" value="1"></label>
+          <label>Offline grace (hours)<input name="offlineGraceHours" type="number" required min="1" max="720" value="24"></label>
+          <label>Valid from<input name="notBefore" type="datetime-local"></label>
+          <label>Expires at<input name="expiresAt" type="datetime-local"></label>
+        </div>
+        <label class="check-row"><input name="perpetual" type="checkbox"> Perpetual license (no expiration)</label>
+        <label>Entitlements (JSON object)<textarea name="entitlements" rows="7" spellcheck="false">{}</textarea><small>Values may be text, integers, or true/false.</small></label>
+        <label>Idempotency key<input name="idempotencyKey" minlength="8" maxlength="128" spellcheck="false"><small>Reuse this key with the exact same request to recover a claim code safely.</small></label>
+      </div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="license-dialog">Cancel</button><button class="button primary" type="submit">Issue license</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="import-dialog" class="modal">
+    <form id="import-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Offline workflow</p><h2>Import license artifact</h2></div><button class="icon-button" type="button" data-close-dialog="import-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form">
+        <div id="import-form-error" class="alert error" role="alert" hidden></div>
+        <p class="muted">The artifact signature, issuer trust, time bounds, product, and claim digest are verified before import.</p>
+        <label>Signed artifact<textarea name="artifact" required maxlength="24576" rows="11" spellcheck="false" placeholder="dlic1.…"></textarea></label>
+      </div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="import-dialog">Cancel</button><button class="button primary" type="submit">Verify and import</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="product-dialog" class="modal small">
+    <form id="product-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Catalog</p><h2>Create product</h2></div><button class="icon-button" type="button" data-close-dialog="product-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form"><div id="product-form-error" class="alert error" role="alert" hidden></div><label>Code<input name="code" required minlength="2" maxlength="64" placeholder="DESKTOP_PRO"></label><label>Name<input name="name" required maxlength="120"></label><label>Description<textarea name="description" maxlength="2000" rows="4"></textarea></label></div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="product-dialog">Cancel</button><button class="button primary" type="submit">Create product</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="user-dialog" class="modal" aria-labelledby="user-dialog-title">
+    <form id="user-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Access control</p><h2 id="user-dialog-title">Add a user</h2></div><button class="icon-button" type="button" data-close-dialog="user-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form">
+        <div id="user-form-error" class="alert error" role="alert" hidden></div>
+        <p class="muted">Invite a person and choose the smallest role that covers their responsibilities. They will set their own password through a one-time setup link.</p>
+        <div class="form-grid"><label>Email address<input name="userInviteEmail" type="email" required maxlength="254" autocomplete="one-time-code" placeholder="admin@example.com"></label><label>Role<select name="role" required></select><small>Roles define the account’s complete permission set.</small></label></div>
+        <div id="create-user-role-preview" class="permission-preview" aria-live="polite"></div>
+        <p class="security-note"><strong>Invitation</strong><span>The account starts active, but cannot sign in until its one-time password setup is completed. Account creation and the selected role are recorded in the audit log.</span></p>
+      </div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="user-dialog">Cancel</button><button class="button primary" type="submit">Create and invite</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="password-reset-request-dialog" class="modal small" aria-labelledby="password-reset-request-title">
+    <form id="password-reset-request-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Account recovery</p><h2 id="password-reset-request-title">Request a setup link</h2></div><button class="icon-button" type="button" data-close-dialog="password-reset-request-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form">
+        <div id="password-reset-request-error" class="alert error" role="alert" hidden></div>
+        <p class="muted">Enter your account email. If it exists, DeniLicense will send a one-time link for choosing a new password.</p>
+        <label>Email address<input name="resetRequestEmail" type="email" required maxlength="254" autocomplete="email"></label>
+      </div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="password-reset-request-dialog">Cancel</button><button class="button primary" type="submit">Request link</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="user-invite-result-dialog" class="modal small" aria-labelledby="setup-link-result-title">
+    <div class="modal-card">
+      <header class="modal-header"><div><p id="setup-link-result-kicker" class="eyebrow">User created</p><h2 id="setup-link-result-title">Invitation ready</h2></div><button class="icon-button" type="button" data-close-dialog="user-invite-result-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form">
+        <p id="user-invite-result-message" class="muted"></p>
+        <div id="manual-invite-fields" class="stack-form" hidden>
+          <label>One-time setup link<output id="user-invite-link" class="token-output"></output></label>
+          <button id="copy-user-invite-link" class="button secondary wide" type="button">Copy setup link</button>
+          <details class="token-details"><summary>Show setup token</summary><output id="user-invite-token" class="token-output compact"></output></details>
+          <p class="alert warning">This token grants one-time password setup access. Send it only through a secure channel and close this window when finished.</p>
+        </div>
+      </div>
+      <footer class="modal-footer"><button class="button primary" type="button" data-close-dialog="user-invite-result-dialog">Done</button></footer>
+    </div>
+  </dialog>
+
+  <dialog id="claim-dialog" class="modal small">
+    <div class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">License issued</p><h2>Save this claim code</h2></div><button class="icon-button" type="button" data-close-dialog="claim-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body"><p class="muted">This code is shown only at issuance. Store it securely and deliver it to the customer.</p><output id="claim-code" class="secret-output"></output><button id="copy-claim-code" class="button secondary wide" type="button">Copy claim code</button><p id="claim-warning" class="alert warning"></p></div>
+      <footer class="modal-footer"><button class="button primary" type="button" data-close-dialog="claim-dialog">I saved the code</button></footer>
+    </div>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="confirm-modal">
+    <form method="dialog" class="modal-card">
+      <div class="modal-body"><div class="confirm-icon" aria-hidden="true">!</div><h2 id="confirm-title">Confirm action</h2><p id="confirm-message" class="muted"></p></div>
+      <footer class="modal-footer"><button value="cancel" class="button ghost">Cancel</button><button id="confirm-accept" value="confirm" class="button danger">Confirm</button></footer>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script type="module" src="/ui/app.js"></script>
+</body>
+</html>

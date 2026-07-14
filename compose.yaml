@@ -20,11 +20,11 @@ services:
 
   activation-key-init:
     build: .
-    entrypoint: ["/bin/sh", "-c"]
+    entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
         test -f /var/lib/denilicense/secrets/activation.key.json ||
-        /usr/local/bin/denilic keygen --purpose activation
+        python -m denilicense.offline_cli keygen --purpose activation
         --private /var/lib/denilicense/secrets/activation.key.json
         --public /var/lib/denilicense/secrets/activation.public.json
     environment:
@@ -48,13 +48,12 @@ services:
       DENILICENSE_ENV: development
       DENILICENSE_HTTP_ADDRESS: :8080
       DENILICENSE_DATABASE_URL: postgres://denilicense:denilicense-development-only@postgres:5432/denilicense?sslmode=disable
-      # Predictable development values. Replace every secret outside local Compose.
       DENILICENSE_TOKEN_PEPPER: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       DENILICENSE_DEVICE_PEPPER: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
       DENILICENSE_ISSUANCE_PEPPER: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI
       DENILICENSE_REGISTRATION_MODE: open
       DENILICENSE_EXPOSE_DEV_TOKENS: "true"
-      DENILICENSE_ALLOWED_ORIGINS: http://localhost:3000
+      DENILICENSE_ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:8080,http://localhost:8080
       DENILICENSE_ACTIVATION_ISSUER: http://127.0.0.1:8080
       DENILICENSE_ACTIVATION_KEY_FILE: /var/lib/denilicense/secrets/activation.key.json
       DENILICENSE_ACTIVATION_KEY_PASSPHRASE: denilicense-development-activation-passphrase
@@ -69,7 +68,13 @@ services:
       - no-new-privileges:true
     cap_drop: [ALL]
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/ready"]
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=2).read()
       interval: 10s
       timeout: 3s
       retries: 10
