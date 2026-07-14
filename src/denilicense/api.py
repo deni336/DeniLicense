@@ -7,12 +7,14 @@ import logging
 import mimetypes
 import re
 import secrets
+import sysconfig
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from importlib import resources
+from pathlib import Path
 from typing import Annotated, Any, NoReturn
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
@@ -22,6 +24,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.routing import APIRoute
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import auth
@@ -66,37 +69,48 @@ from .emailer import EmailJob, EmailSender
 from .middleware import ClientSourceResolver, RateLimiter, RequestMiddleware
 from .schemas import (
     ActivationRequest,
+    ApproveLicenseRequest,
+    ChangePasswordRequest,
     ClaimLicenseRequest,
     CompleteRenewalRequest,
+    CreateCustomerLicenseRequest,
     CreateLicenseRequest,
     CreateManagedUserRequest,
     CreateProductRequest,
+    DeleteLicenseRequest,
+    DeleteUserRequest,
+    DenyLicenseRequest,
     EmailRequest,
     ImportLicenseRequest,
     IssuerStatusRequest,
     LicenseStateRequest,
+    LifecycleRequest,
     LoginRequest,
     PasswordResetConfirmRequest,
+    ProductStatusRequest,
     RefreshRequest,
     RegisterIssuerRequest,
     RegisterRequest,
     RenewalChallengeRequest,
-    TokenRequest,
     UserAccessRequest,
     UserRoleRequest,
     UserStatusRequest,
+    VerifyEmailRequest,
 )
 from .store import (
     ActivateParams,
     AdminActivationListFilter,
     AuditListFilter,
     CreateLicenseParams,
+    CreateLicenseRequestParams,
     CreateManagedUserParams,
     CreateProductParams,
     CreateSessionParams,
-    CreateUserParams,
     LicenseListFilter,
+    LicenseRequestListFilter,
     RegisterIssuerParams,
+    RegisterPendingUserParams,
+    ResendPasswordSetupParams,
     RotateSessionParams,
     Store,
     UpdateUserAccessParams,
@@ -181,6 +195,8 @@ def _problem(request: Request, error: APIError, headers: dict[str, str] | None =
         headers=headers,
     )
     response.headers["Cache-Control"] = "no-store"
+    if error.status == 401:
+        response.headers.setdefault("WWW-Authenticate", "Bearer")
     return response
 
 
@@ -248,18 +264,43 @@ def _ui_response(request: Request, asset_path: str) -> Response:
     content = resource.read_bytes()
     media_type = mimetypes.guess_type(asset_path)[0] or "application/octet-stream"
     if media_type == "text/html":
+        ui_root = resources.files("denilicense").joinpath("ui")
+        html = content.decode("utf-8")
+        for asset_name in ("app.css", "app.js"):
+            asset_digest = hashlib.sha256(ui_root.joinpath(asset_name).read_bytes()).hexdigest()
+            html = html.replace(
+                f"/ui/{asset_name}",
+                f"/ui/{asset_name}?v={asset_digest[:16]}",
+            )
+        content = html.encode("utf-8")
         return Response(content, media_type=media_type, headers={"Cache-Control": "no-store"})
 
-    etag = f'"{hashlib.sha256(content).hexdigest()}"'
+    digest = hashlib.sha256(content).hexdigest()
+    etag = f'"{digest}"'
+    version_matches = request.query_params.get("v") == digest[:16]
     cache_control = (
         "public, max-age=31536000, immutable"
-        if HASHED_ASSET.search(resource.name)
-        else "public, max-age=3600, must-revalidate"
+        if HASHED_ASSET.search(resource.name) or version_matches
+        else "public, max-age=0, must-revalidate"
     )
     headers = {"Cache-Control": cache_control, "ETag": etag}
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
     return Response(content, media_type=media_type, headers=headers)
+
+
+def _entitlement_guide() -> str:
+    candidates = (
+        Path(__file__).resolve().parents[2] / "docs" / "ENTITLEMENTS.md",
+        Path(sysconfig.get_path("data")) / "share" / "denilicense" / "docs" / "ENTITLEMENTS.md",
+    )
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.stat().st_size <= 256 * 1024:
+                return candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    _raise(NOT_FOUND)
 
 
 def _utc(value: datetime) -> datetime:
@@ -423,7 +464,13 @@ def create_app(
     email = EmailSender(settings.email_webhook_url, settings.email_webhook_bearer, settings.public_app_url)
     resolver = ClientSourceResolver(settings.trusted_proxy_cidrs, settings.device_pepper)
     login_limiter = RateLimiter(10, 60, resolver)
+    auth_token_limiter = RateLimiter(20, 60, resolver)
+    email_action_limiter = RateLimiter(5, 3600, resolver)
+    password_change_limiter = RateLimiter(5, 60, resolver)
+    registration_limiter = RateLimiter(5, 3600, resolver)
     claim_limiter = RateLimiter(10, 3600, resolver)
+    license_request_limiter = RateLimiter(10, 3600, resolver)
+    invitation_limiter = RateLimiter(20, 3600, resolver)
     renewal_limiter = RateLimiter(120, 60, resolver)
     dummy_password = password_manager.hash("dummy password used for timing only")
 
@@ -458,6 +505,11 @@ def create_app(
     app.state.email = email
     app.state.activation_signer = activation_signer
     app.state.activation_jwks = JWKS(tuple(jwks))
+    bearer_scheme = HTTPBearer(
+        auto_error=False,
+        scheme_name="BearerAuth",
+        description="Opaque DeniLicense access token returned by the login or refresh endpoint.",
+    )
 
     app.add_middleware(OriginGuardMiddleware, origins=settings.allowed_origins)
     app.add_middleware(RequestMiddleware, resolver=resolver, production=settings.environment == "production")
@@ -496,11 +548,18 @@ def create_app(
         logger.exception("request failed", extra={"request_id": _request_id(request)})
         return _problem(request, INTERNAL)
 
-    def principal(request: Request) -> Principal:
-        header = request.headers.get("authorization", "")
-        if len(header) < 8 or header[:7].lower() != "bearer ":
+    def principal(
+        request: Request,
+        credentials: Annotated[
+            HTTPAuthorizationCredentials | None,
+            Depends(bearer_scheme),
+        ],
+    ) -> Principal:
+        if credentials is None or credentials.scheme.lower() != "bearer":
             _raise(UNAUTHENTICATED)
-        token = header[7:].strip()
+        token = credentials.credentials.strip()
+        if not token:
+            _raise(UNAUTHENTICATED)
         try:
             digest = auth.hash_token(settings.token_pepper, auth.ACCESS_TOKEN, token)
             value = store.principal_by_access_hash(digest, datetime.now(UTC))
@@ -534,6 +593,7 @@ def create_app(
         Principal, Depends(roles(Role.PLATFORM_OWNER, Role.LICENSE_ADMIN, Role.SUPPORT))
     ]
     AuditReaderDependency = Annotated[Principal, Depends(roles(Role.PLATFORM_OWNER, Role.AUDITOR))]
+    CustomerDependency = Annotated[Principal, Depends(roles(Role.CUSTOMER))]
 
     def limit(request: Request, fallback: int = 100) -> int:
         raw = request.query_params.get("limit", "").strip()
@@ -590,6 +650,20 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.get("/verify-email", include_in_schema=False)
+    def email_verification_redirect(request: Request) -> RedirectResponse:
+        token = request.query_params.get("token", "")
+        query = {"action": "verify-email"}
+        if 1 <= len(token) <= 128 and not any(
+            ord(character) < 32 or ord(character) == 127 for character in token
+        ):
+            query["token"] = token
+        return RedirectResponse(
+            "/ui/?" + urlencode(query),
+            status_code=307,
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/ui/", include_in_schema=False)
     def ui_index(request: Request) -> Response:
         return _ui_response(request, "index.html")
@@ -618,6 +692,14 @@ def create_app(
             headers={"Cache-Control": "public, max-age=300"},
         )
 
+    @app.get("/docs/entitlements", include_in_schema=False)
+    def entitlement_guide() -> PlainTextResponse:
+        return PlainTextResponse(
+            _entitlement_guide(),
+            media_type="text/markdown",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
     @app.get("/.well-known/denilicense-activation-keys.json")
     def activation_keys() -> JSONResponse:
         return _json(app.state.activation_jwks.to_dict(), public_max_age=300)
@@ -626,44 +708,51 @@ def create_app(
     def public_products() -> JSONResponse:
         return _json({"items": store.list_products(False)})
 
+    @app.get("/api/v1/public/config")
+    def public_config() -> JSONResponse:
+        return _json(
+            {
+                "registrationOpen": settings.registration_mode == "open",
+                "passwordMinCharacters": auth.PASSWORD_MIN_CHARS,
+            },
+            public_max_age=60,
+        )
+
     @app.post("/api/v1/auth/register", status_code=202)
     def register(body: RegisterRequest, request: Request) -> JSONResponse:
-        login_limiter.enforce(request)
+        registration_limiter.enforce(request)
         if settings.registration_mode != "open":
             _raise(FORBIDDEN)
         try:
             email_address, normalized = auth.normalize_email(body.email)
-            password_hash = password_manager.hash(body.password)
             token = auth.new_token(auth.EMAIL_VERIFICATION_TOKEN)
             token_hash = auth.hash_token(settings.token_pepper, auth.EMAIL_VERIFICATION_TOKEN, token)
         except auth.AuthenticationError as exc:
             raise _new(INVALID) from exc
-        created = True
+        recipient, pending = ("", False)
         try:
-            store.create_user(
-                CreateUserParams(
+            recipient, pending = store.register_pending_user(
+                RegisterPendingUserParams(
                     id=uuid4(),
                     email=email_address,
                     normalized_email=normalized,
-                    password_hash=password_hash,
-                    role=Role.CUSTOMER,
                     verification_token_id=uuid4(),
                     verification_token_hash=token_hash,
                     verification_token_expiry=datetime.now(UTC) + settings.verification_ttl,
                 )
             )
         except ConflictError:
-            created = False
-        if created:
-            email.enqueue(EmailJob("verification", email_address, token, _request_id(request)))
+            pending = False
+        if pending:
+            email.enqueue(EmailJob("verification", recipient, token, _request_id(request)))
         response: dict[str, Any] = {"accepted": True, "verificationRequired": True}
-        if created and settings.expose_dev_tokens:
+        if pending and settings.expose_dev_tokens:
             response["developmentVerificationToken"] = token
         return _json(response, 202)
 
     @app.post("/api/v1/auth/verification/request", status_code=202)
     def request_verification(body: EmailRequest, request: Request) -> JSONResponse:
-        login_limiter.enforce(request)
+        email_action_limiter.enforce(request)
         try:
             _, normalized = auth.normalize_email(body.email)
         except auth.AuthenticationError:
@@ -683,11 +772,12 @@ def create_app(
         return _json(response, 202)
 
     @app.post("/api/v1/auth/verify-email")
-    def verify_email(body: TokenRequest, request: Request) -> JSONResponse:
-        login_limiter.enforce(request)
+    def verify_email(body: VerifyEmailRequest, request: Request) -> JSONResponse:
+        auth_token_limiter.enforce(request)
         try:
             token_hash = auth.hash_token(settings.token_pepper, auth.EMAIL_VERIFICATION_TOKEN, body.token)
-            user = store.verify_email(token_hash, datetime.now(UTC))
+            password_hash = password_manager.hash(body.new_password)
+            user = store.verify_email(token_hash, password_hash, datetime.now(UTC))
         except (auth.AuthenticationError, NotFoundError, InvalidError) as exc:
             raise _new(INVALID) from exc
         return _json({"user": user})
@@ -728,18 +818,29 @@ def create_app(
             raise _new(UNAUTHENTICATED) from exc
         try:
             credential = store.user_credential_by_email(normalized)
-            encoded = credential.password_hash
+            encoded = (
+                credential.password_hash
+                if credential.user.email_verified_at is not None
+                and not credential.user.password_setup_required
+                else dummy_password
+            )
         except NotFoundError:
             credential = None
             encoded = dummy_password
         valid = password_manager.verify(encoded, body.password)
-        if credential is None or not valid or credential.user.status != "active":
+        if (
+            credential is None
+            or not valid
+            or credential.user.status != "active"
+            or credential.user.email_verified_at is None
+            or credential.user.password_setup_required
+        ):
             _raise(UNAUTHENTICATED)
         return _json(new_session(credential.user))
 
     @app.post("/api/v1/auth/refresh")
     def refresh(body: RefreshRequest, request: Request) -> JSONResponse:
-        login_limiter.enforce(request)
+        auth_token_limiter.enforce(request)
         try:
             old_hash = auth.hash_token(settings.token_pepper, auth.REFRESH_TOKEN, body.refresh_token)
         except auth.AuthenticationError as exc:
@@ -777,7 +878,7 @@ def create_app(
 
     @app.post("/api/v1/auth/password-reset/request", status_code=202)
     def request_password_reset(body: EmailRequest, request: Request) -> JSONResponse:
-        login_limiter.enforce(request)
+        email_action_limiter.enforce(request)
         try:
             _, normalized = auth.normalize_email(body.email)
         except auth.AuthenticationError:
@@ -798,7 +899,7 @@ def create_app(
 
     @app.post("/api/v1/auth/password-reset/confirm", status_code=204)
     def confirm_password_reset(body: PasswordResetConfirmRequest, request: Request) -> Response:
-        login_limiter.enforce(request)
+        auth_token_limiter.enforce(request)
         try:
             token_hash = auth.hash_token(settings.token_pepper, auth.PASSWORD_RESET_TOKEN, body.token)
             encoded = password_manager.hash(body.new_password)
@@ -815,6 +916,65 @@ def create_app(
     @app.get("/api/v1/auth/me")
     def me(value: PrincipalDependency) -> JSONResponse:
         return _json({"user": value.user})
+
+    @app.post("/api/v1/auth/password/change", status_code=204)
+    def change_password(
+        body: ChangePasswordRequest,
+        request: Request,
+        value: VerifiedDependency,
+    ) -> Response:
+        password_change_limiter.enforce(request)
+        credential = store.user_credential_by_id(value.user.id)
+        if not password_manager.verify(credential.password_hash, body.current_password):
+            _raise(INVALID)
+        if body.current_password == body.new_password:
+            _raise(INVALID)
+        try:
+            new_password_hash = password_manager.hash(body.new_password)
+        except auth.AuthenticationError as exc:
+            raise _new(INVALID) from exc
+        store.change_password(
+            value.user.id,
+            value.session_id,
+            credential.password_hash,
+            new_password_hash,
+            datetime.now(UTC),
+            _audit(request, "user.password_change", "user"),
+        )
+        return Response(status_code=204)
+
+    @app.get("/api/v1/auth/sessions")
+    def list_sessions(value: VerifiedDependency) -> JSONResponse:
+        items = []
+        for session in store.list_account_sessions(value.user.id, datetime.now(UTC)):
+            item = _wire(session)
+            item["isCurrent"] = session.id == value.session_id
+            items.append(item)
+        return _json({"items": items})
+
+    @app.post("/api/v1/auth/sessions/revoke-others", status_code=204)
+    def revoke_other_sessions(request: Request, value: VerifiedDependency) -> Response:
+        store.revoke_other_user_sessions(
+            value.user.id,
+            value.session_id,
+            datetime.now(UTC),
+            _audit(request, "session.revoke_others", "user"),
+        )
+        return Response(status_code=204)
+
+    @app.delete("/api/v1/auth/sessions/{session_id}", status_code=204)
+    def revoke_account_session(
+        session_id: str,
+        request: Request,
+        value: VerifiedDependency,
+    ) -> Response:
+        store.revoke_user_session(
+            value.user.id,
+            _uuid(session_id, canonical=True),
+            datetime.now(UTC),
+            _audit(request, "session.revoke", "session"),
+        )
+        return Response(status_code=204)
 
     @app.post("/api/v1/licenses/claim")
     def claim_license(
@@ -835,6 +995,63 @@ def create_app(
             # Formatting, lookup, ownership, and state intentionally share one response.
             raise _new(INVALID) from exc
         return _json({"license": licensed})
+
+    @app.post("/api/v1/license-requests", status_code=201)
+    def create_customer_license_request(
+        body: CreateCustomerLicenseRequest,
+        request: Request,
+        value: CustomerDependency,
+    ) -> JSONResponse:
+        license_request_limiter.enforce(request)
+        product_code = body.product_code.strip().upper()
+        if not PRODUCT_CODE.fullmatch(product_code):
+            _raise(INVALID)
+        try:
+            product = store.product_by_code(product_code)
+        except NotFoundError as exc:
+            raise _new(NOT_FOUND) from exc
+        item = store.create_license_request(
+            CreateLicenseRequestParams(
+                id=uuid4(),
+                requester_user_id=value.user.id,
+                product_id=product.id,
+                requested_activations=body.requested_activations,
+                message=body.message,
+                audit=_audit(request, "license_request.create", "license_request"),
+            )
+        )
+        return _json({"request": item}, 201)
+
+    @app.get("/api/v1/license-requests")
+    def list_customer_license_requests(
+        request: Request,
+        value: CustomerDependency,
+    ) -> JSONResponse:
+        status = request.query_params.get("status", "").strip()
+        if status and status not in {"pending", "approved", "denied", "cancelled", "fulfilled"}:
+            _raise(INVALID)
+        return _json({"items": store.list_user_license_requests(value.user.id, status, limit(request))})
+
+    @app.get("/api/v1/license-requests/{request_id}")
+    def get_customer_license_request(
+        request_id: str,
+        value: CustomerDependency,
+    ) -> JSONResponse:
+        return _json({"request": store.license_request_for_user(_uuid(request_id), value.user.id)})
+
+    @app.post("/api/v1/license-requests/{request_id}/cancel")
+    def cancel_customer_license_request(
+        request_id: str,
+        request: Request,
+        value: CustomerDependency,
+    ) -> JSONResponse:
+        item = store.cancel_license_request(
+            _uuid(request_id),
+            value.user.id,
+            datetime.now(UTC),
+            _audit(request, "license_request.cancel", "license_request"),
+        )
+        return _json({"request": item})
 
     @app.get("/api/v1/licenses")
     def list_customer_licenses(value: VerifiedDependency) -> JSONResponse:
@@ -1041,6 +1258,25 @@ def create_app(
             _raise(INVALID)
         return _json({"items": store.list_products(raw == "true")})
 
+    @app.post("/api/v1/admin/products/{product_code}/status")
+    def set_product_status(
+        product_code: str,
+        body: ProductStatusRequest,
+        request: Request,
+        value: LicenseWriterDependency,
+    ) -> JSONResponse:
+        code = product_code.strip().upper()
+        if not PRODUCT_CODE.fullmatch(code):
+            _raise(INVALID)
+        product = store.update_product_status(
+            code,
+            body.status,
+            value.user.id,
+            body.expected_revision,
+            _audit(request, f"product.{body.status}", "product"),
+        )
+        return _json({"product": product})
+
     @app.get("/api/v1/admin/issuers")
     def list_admin_issuers(request: Request, _: ManagementReaderDependency) -> JSONResponse:
         status = request.query_params.get("status", "").strip()
@@ -1114,6 +1350,143 @@ def create_app(
             message += b"\x00" + request_hash
         return hmac.new(settings.issuance_pepper, message, hashlib.sha256).digest()
 
+    def derive_request_issuance(purpose: str, request_id: UUID, request_hash: bytes) -> bytes:
+        message = (
+            f"DeniLicense/license-request-issuance/{purpose}/v1\x00".encode()
+            + request_id.bytes
+            + b"\x00"
+            + request_hash
+        )
+        return hmac.new(settings.issuance_pepper, message, hashlib.sha256).digest()
+
+    @app.get("/api/v1/admin/license-requests")
+    def list_admin_license_requests(
+        request: Request,
+        _: ManagementReaderDependency,
+    ) -> JSONResponse:
+        status = request.query_params.get("status", "").strip()
+        product_code = request.query_params.get("productCode", "").strip().upper()
+        requester_email = request.query_params.get("requesterEmail", "").strip()
+        if status and status not in {"pending", "approved", "denied", "cancelled", "fulfilled"}:
+            _raise(INVALID)
+        if product_code and not PRODUCT_CODE.fullmatch(product_code):
+            _raise(INVALID)
+        normalized = ""
+        if requester_email:
+            try:
+                _, normalized = auth.normalize_email(requester_email)
+            except auth.AuthenticationError as exc:
+                raise _new(INVALID) from exc
+        return _json(
+            {
+                "items": store.list_license_requests(
+                    LicenseRequestListFilter(
+                        status=status,
+                        requester_normalized_email=normalized,
+                        product_code=product_code,
+                        limit=limit(request),
+                    )
+                )
+            }
+        )
+
+    @app.get("/api/v1/admin/license-requests/{request_id}")
+    def get_admin_license_request(
+        request_id: str,
+        _: ManagementReaderDependency,
+    ) -> JSONResponse:
+        return _json({"request": store.license_request_by_id(_uuid(request_id))})
+
+    @app.post("/api/v1/admin/license-requests/{request_id}/deny")
+    def deny_admin_license_request(
+        request_id: str,
+        body: DenyLicenseRequest,
+        request: Request,
+        value: LicenseWriterDependency,
+    ) -> JSONResponse:
+        item = store.deny_license_request(
+            _uuid(request_id),
+            value.user.id,
+            body.admin_notes,
+            datetime.now(UTC),
+            _audit(request, "license_request.deny", "license_request"),
+        )
+        return _json({"request": item})
+
+    @app.post("/api/v1/admin/license-requests/{request_id}/approve")
+    def approve_admin_license_request(
+        request_id: str,
+        body: ApproveLicenseRequest,
+        request: Request,
+        value: LicenseWriterDependency,
+    ) -> JSONResponse:
+        request_uuid = _uuid(request_id)
+        requested = store.license_request_by_id(request_uuid)
+        subject = body.subject.strip()
+        grace = body.offline_grace_seconds or 86_400
+        if not 3600 <= grace <= 30 * 86_400:
+            _raise(INVALID)
+        if body.perpetual == (body.expires_at is not None):
+            _raise(INVALID)
+        now = datetime.now(UTC)
+        not_before = _utc(body.not_before) if body.not_before else now
+        expires_at = _utc(body.expires_at) if body.expires_at else None
+        if expires_at is not None and (expires_at <= not_before or expires_at - now > timedelta(days=3650)):
+            _raise(INVALID)
+        material = canonical_json(
+            {
+                "entitlements": body.entitlements,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+                "max_activations": body.max_activations,
+                "not_before": not_before.isoformat() if body.not_before else None,
+                "offline_grace_seconds": grace,
+                "perpetual": body.perpetual,
+                "product_code": requested.product_code,
+                "request_id": str(request_uuid),
+                "subject": subject,
+            }
+        )
+        request_hash = hashlib.sha256(material).digest()
+        raw_serial = bytearray(derive_request_issuance("serial", request_uuid, request_hash)[:16])
+        raw_serial[6] = (raw_serial[6] & 0x0F) | 0x40
+        raw_serial[8] = (raw_serial[8] & 0x3F) | 0x80
+        serial = UUID(bytes=bytes(raw_serial))
+        claim = claim_code_from_entropy(
+            derive_request_issuance("claim-code", request_uuid, request_hash)[:20]
+        )
+        approved_request, licensed, idempotent = store.approve_license_request(
+            request_uuid,
+            CreateLicenseParams(
+                id=uuid4(),
+                serial=serial,
+                product_id=requested.product_id,
+                source="online",
+                issuer_key_id=None,
+                import_artifact=None,
+                import_artifact_hash=None,
+                creation_request_hash=request_hash,
+                claim_code_hash=claim.digest,
+                claim_code_suffix=claim.suffix,
+                subject=subject,
+                issued_at=now,
+                not_before=not_before,
+                expires_at=expires_at,
+                max_activations=body.max_activations,
+                offline_grace_seconds=grace,
+                entitlements=body.entitlements,
+                metadata={"licenseRequestId": str(request_uuid)},
+                created_by=value.user.id,
+                audit=_audit(request, "license.create_from_request", "license"),
+            ),
+            "",
+            now,
+            _audit(request, "license_request.approve", "license_request"),
+        )
+        return _json(
+            {"request": approved_request, "license": licensed, "idempotent": idempotent},
+            200 if idempotent else 201,
+        )
+
     @app.post("/api/v1/admin/licenses", status_code=201)
     def create_online_license(
         body: CreateLicenseRequest,
@@ -1137,8 +1510,6 @@ def create_app(
             product = store.product_by_code(product_code)
         except NotFoundError as exc:
             raise _new(NOT_FOUND) from exc
-        if product.status != "active":
-            _raise(NOT_FOUND)
         now = datetime.now(UTC)
         not_before = _utc(body.not_before) if body.not_before else now
         expires_at = _utc(body.expires_at) if body.expires_at else None
@@ -1226,8 +1597,6 @@ def create_app(
             ):
                 _raise(INVALID)
             product = store.product_by_code(claims.audience)
-            if product.status != "active":
-                _raise(INVALID)
             serial = _uuid(claims.serial, canonical=True)
             digest = b64url_decode(claims.claim_code_sha256, size=32)
             licensed, idempotent = store.create_license(
@@ -1269,24 +1638,81 @@ def create_app(
         license_id: str,
         body: LicenseStateRequest,
         request: Request,
-        _: LicenseWriterDependency,
+        value: LicenseWriterDependency,
     ) -> Response:
         store.set_license_state(
             _uuid(license_id),
             body.state,
+            value.user.id,
             datetime.now(UTC),
             _audit(request, "license.state_change", "license"),
         )
         return Response(status_code=204)
 
+    @app.post("/api/v1/admin/licenses/{license_id}/archive")
+    def archive_admin_license(
+        license_id: str,
+        body: LifecycleRequest,
+        request: Request,
+        value: LicenseWriterDependency,
+    ) -> JSONResponse:
+        item = store.archive_license(
+            _uuid(license_id),
+            value.user.id,
+            datetime.now(UTC),
+            _audit(request, "license.archive", "license"),
+            expected_revision=body.expected_revision,
+        )
+        return _json({"license": item})
+
+    @app.post("/api/v1/admin/licenses/{license_id}/restore")
+    def restore_admin_license(
+        license_id: str,
+        body: LifecycleRequest,
+        request: Request,
+        value: LicenseWriterDependency,
+    ) -> JSONResponse:
+        item = store.restore_license(
+            _uuid(license_id),
+            value.user.id,
+            datetime.now(UTC),
+            _audit(request, "license.restore", "license"),
+            expected_revision=body.expected_revision,
+        )
+        return _json({"license": item})
+
+    @app.post("/api/v1/admin/licenses/{license_id}/delete", status_code=204)
+    def delete_admin_license(
+        license_id: str,
+        body: DeleteLicenseRequest,
+        request: Request,
+        value: OwnerDependency,
+    ) -> Response:
+        identifier = _uuid(license_id)
+        current = store.license_by_id(identifier)
+        if body.serial != str(current.serial):
+            _raise(CONFLICT)
+        store.delete_license(
+            identifier,
+            value.user.id,
+            datetime.now(UTC),
+            _audit(request, "license.delete", "license"),
+            expected_revision=body.expected_revision,
+        )
+        return Response(status_code=204)
+
     @app.get("/api/v1/admin/licenses")
-    def list_admin_licenses(request: Request, _: ManagementReaderDependency) -> JSONResponse:
+    def list_admin_licenses(
+        request: Request,
+        value: ManagementReaderDependency,
+    ) -> JSONResponse:
         filters = LicenseListFilter(limit=limit(request))
         serial_text = request.query_params.get("serial", "").strip()
         owner_email = request.query_params.get("ownerEmail", "").strip()
         suffix = request.query_params.get("claimCodeSuffix", "").strip().upper()
         product_code = request.query_params.get("productCode", "").strip().upper()
         state = request.query_params.get("state", "").strip()
+        lifecycle = request.query_params.get("lifecycle", "current").strip()
         serial = None
         if serial_text:
             serial = _uuid(serial_text, canonical=True)
@@ -1302,23 +1728,45 @@ def create_app(
             _raise(INVALID)
         if state and state not in {"active", "suspended", "revoked"}:
             _raise(INVALID)
+        if lifecycle not in {"current", "archived", "deleted", "all"}:
+            _raise(INVALID)
+        if lifecycle in {"deleted", "all"} and value.user.role is not Role.PLATFORM_OWNER:
+            _raise(FORBIDDEN)
         filters = LicenseListFilter(
             serial=serial,
             owner_normalized_email=normalized,
             claim_code_suffix=suffix,
             product_code=product_code,
             state=state,
+            lifecycle=lifecycle,
             limit=filters.limit,
         )
         return _json({"items": store.list_licenses(filters)})
 
     @app.get("/api/v1/admin/licenses/{license_id}")
-    def get_admin_license(license_id: str, _: ManagementReaderDependency) -> JSONResponse:
-        return _json({"license": store.license_by_id(_uuid(license_id))})
+    def get_admin_license(
+        license_id: str,
+        value: ManagementReaderDependency,
+    ) -> JSONResponse:
+        item = store.license_by_id(
+            _uuid(license_id),
+            include_deleted=value.user.role is Role.PLATFORM_OWNER,
+        )
+        return _json({"license": item})
 
     @app.get("/api/v1/admin/licenses/{license_id}/activations")
-    def list_admin_activations(license_id: str, _: ManagementReaderDependency) -> JSONResponse:
-        return _json({"items": store.list_activations(_uuid(license_id))})
+    def list_admin_activations(
+        license_id: str,
+        value: ManagementReaderDependency,
+    ) -> JSONResponse:
+        return _json(
+            {
+                "items": store.list_activations(
+                    _uuid(license_id),
+                    include_deleted=value.user.role is Role.PLATFORM_OWNER,
+                )
+            }
+        )
 
     @app.get("/api/v1/admin/activations")
     def list_all_admin_activations(
@@ -1366,10 +1814,11 @@ def create_app(
     def deactivate_admin_activation(
         activation_id: str,
         request: Request,
-        _: ActivationManagerDependency,
+        value: ActivationManagerDependency,
     ) -> Response:
         store.deactivate_activation(
             _uuid(activation_id),
+            value.user.id,
             _audit(request, "activation.admin_deactivate", "activation"),
         )
         return Response(status_code=204)
@@ -1383,7 +1832,10 @@ def create_app(
                 _, normalized = auth.normalize_email(raw_email)
             except auth.AuthenticationError as exc:
                 raise _new(INVALID) from exc
-        return _json({"items": store.list_users(normalized, limit(request))})
+        lifecycle = request.query_params.get("lifecycle", "current").strip()
+        if lifecycle not in {"current", "archived", "deleted", "all"}:
+            _raise(INVALID)
+        return _json({"items": store.list_users(normalized, limit(request), lifecycle=lifecycle)})
 
     @app.post("/api/v1/admin/users", status_code=201)
     def create_admin_user(
@@ -1426,9 +1878,98 @@ def create_app(
             response["developmentPasswordResetToken"] = setup_token
         return _json(response, 201)
 
+    @app.post("/api/v1/admin/users/{user_id}/invitation/resend", status_code=202)
+    def resend_admin_user_invitation(
+        user_id: str,
+        request: Request,
+        owner: OwnerDependency,
+    ) -> JSONResponse:
+        invitation_limiter.enforce(request)
+        try:
+            setup_token = auth.new_token(auth.PASSWORD_RESET_TOKEN)
+            setup_token_hash = auth.hash_token(settings.token_pepper, auth.PASSWORD_RESET_TOKEN, setup_token)
+        except auth.AuthenticationError as exc:
+            raise _new(INVALID) from exc
+        user = store.resend_password_setup(
+            ResendPasswordSetupParams(
+                user_id=_uuid(user_id),
+                actor_user_id=owner.user.id,
+                token_id=uuid4(),
+                token_hash=setup_token_hash,
+                expires_at=datetime.now(UTC) + settings.password_reset_ttl,
+                audit=_audit(request, "user.invitation_resend", "user"),
+            )
+        )
+        delivered = email.enqueue(EmailJob("password_reset", user.email, setup_token, _request_id(request)))
+        response: dict[str, Any] = {
+            "accepted": True,
+            "user": user,
+            "invitationDelivery": "email" if delivered else "manual",
+        }
+        if settings.expose_dev_tokens:
+            response["developmentPasswordResetToken"] = setup_token
+        return _json(response, 202)
+
+    @app.post("/api/v1/admin/users/{user_id}/archive")
+    def archive_admin_user(
+        user_id: str,
+        body: LifecycleRequest,
+        request: Request,
+        owner: OwnerDependency,
+    ) -> JSONResponse:
+        user = store.archive_user(
+            _uuid(user_id),
+            owner.user.id,
+            datetime.now(UTC),
+            _audit(request, "user.archive", "user"),
+            expected_revision=body.expected_revision,
+        )
+        return _json({"user": user})
+
+    @app.post("/api/v1/admin/users/{user_id}/restore")
+    def restore_admin_user(
+        user_id: str,
+        body: LifecycleRequest,
+        request: Request,
+        owner: OwnerDependency,
+    ) -> JSONResponse:
+        user = store.restore_user(
+            _uuid(user_id),
+            owner.user.id,
+            datetime.now(UTC),
+            _audit(request, "user.restore", "user"),
+            expected_revision=body.expected_revision,
+        )
+        return _json({"user": user})
+
+    @app.post("/api/v1/admin/users/{user_id}/delete", status_code=204)
+    def delete_admin_user(
+        user_id: str,
+        body: DeleteUserRequest,
+        request: Request,
+        owner: OwnerDependency,
+    ) -> Response:
+        identifier = _uuid(user_id)
+        current = store.user_by_id(identifier)
+        try:
+            _, supplied = auth.normalize_email(body.email)
+            _, expected = auth.normalize_email(current.email)
+        except auth.AuthenticationError as exc:
+            raise _new(CONFLICT) from exc
+        if supplied != expected:
+            _raise(CONFLICT)
+        store.delete_user(
+            identifier,
+            owner.user.id,
+            datetime.now(UTC),
+            _audit(request, "user.delete", "user"),
+            expected_revision=body.expected_revision,
+        )
+        return Response(status_code=204)
+
     @app.get("/api/v1/admin/users/{user_id}")
     def get_admin_user(user_id: str, _: OwnerDependency) -> JSONResponse:
-        return _json({"user": store.user_by_id(_uuid(user_id))})
+        return _json({"user": store.user_by_id(_uuid(user_id), include_deleted=True)})
 
     @app.post("/api/v1/admin/users/{user_id}/role")
     def set_admin_user_role(
@@ -1442,6 +1983,7 @@ def create_app(
                 user_id=_uuid(user_id),
                 actor_user_id=owner.user.id,
                 role=Role(body.role),
+                expected_revision=body.expected_revision,
                 audit=_audit(request, "user.role_change", "user"),
             )
         )
@@ -1459,6 +2001,7 @@ def create_app(
                 user_id=_uuid(user_id),
                 actor_user_id=owner.user.id,
                 status=body.status,
+                expected_revision=body.expected_revision,
                 audit=_audit(request, "user.status_change", "user"),
             )
         )
@@ -1477,6 +2020,7 @@ def create_app(
                 actor_user_id=owner.user.id,
                 role=Role(body.role),
                 status=body.status,
+                expected_revision=body.expected_revision,
                 audit=_audit(request, "user.access_change", "user"),
             )
         )

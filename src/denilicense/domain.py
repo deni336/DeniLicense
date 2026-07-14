@@ -29,6 +29,10 @@ class User:
     status: str
     email_verified_at: datetime | None
     created_at: datetime
+    password_setup_required: bool = False
+    archived_at: datetime | None = None
+    deleted_at: datetime | None = None
+    revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +48,15 @@ class Principal:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountSession:
+    id: UUID
+    created_at: datetime
+    last_seen_at: datetime
+    access_expires_at: datetime
+    refresh_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class Product:
     id: UUID
     code: str
@@ -52,6 +65,7 @@ class Product:
     status: str
     created_at: datetime
     updated_at: datetime
+    revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +100,27 @@ class License:
     revision: int
     claim_code_suffix: str
     claimed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+    deleted_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LicenseRequest:
+    id: UUID
+    requester_user_id: UUID
+    requester_email: str
+    product_id: UUID
+    product_code: str
+    product_name: str
+    requested_activations: int
+    message: str
+    status: str
+    admin_notes: str
+    reviewed_by: UUID | None
+    reviewed_at: datetime | None
+    fulfilled_license_id: UUID | None
     created_at: datetime
     updated_at: datetime
 

@@ -17,6 +17,7 @@ RUN python -m pip install --requirement requirements.lock \
     && chown -R denilicense:denilicense /var/lib/denilicense
 
 COPY --chown=denilicense:denilicense src/ ./src/
+COPY --chown=denilicense:denilicense docs/ENTITLEMENTS.md ./docs/ENTITLEMENTS.md
 
 USER 10001:10001
 WORKDIR /var/lib/denilicense

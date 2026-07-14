@@ -19,6 +19,44 @@ docker compose run --rm api bootstrap-owner --email owner@example.com
 
 Stop the containers with `docker compose down`. Add `--volumes` only when you intentionally want to destroy the development database and generated activation key.
 
+## Container-to-container access
+
+The development Compose stack publishes the browser UI on host loopback and
+also attaches the API to a stable Docker bridge named `denilicense-network`.
+The API has the network alias `denilicense-api`. PostgreSQL remains on a
+separate backend bridge and is not exposed to application containers attached
+only to the integration bridge. Its development port is published only on host
+loopback so the repository-level `python main.py` launcher can use the same
+database without opening it to the LAN.
+
+Start DeniLicense first so Docker creates the bridge. In the other project's
+Compose file, attach only the service that needs licensing:
+
+```yaml
+services:
+  your-app:
+    environment:
+      DENILICENSE_URL: http://denilicense-api:8080
+    networks:
+      - default
+      - denilicense
+
+networks:
+  denilicense:
+    external: true
+    name: denilicense-network
+```
+
+Use `http://denilicense-api:8080`, not `localhost`, from that container.
+Neither Docker Desktop's host-networking option nor `network_mode: host` is
+required. Networks are a runtime Compose concern, so no Dockerfile network tag
+exists or is needed.
+
+`DENILICENSE_ACTIVATION_ISSUER` is the logical issuer embedded in signed leases.
+Product code must validate the configured issuer exactly even when it fetches
+the API or JWK set through the `denilicense-api` network alias. In production,
+set the issuer to the stable public HTTPS identity shared by every client.
+
 The Compose credentials, peppers, key passphrase, HTTP listener, and database TLS setting are intentionally unsafe outside local development.
 
 ## Required production configuration
@@ -34,11 +72,11 @@ At minimum, set:
 - HTTPS `DENILICENSE_PUBLIC_APP_URL` and `DENILICENSE_EMAIL_WEBHOOK_URL`, plus a webhook bearer value of at least 32 characters.
 - `DENILICENSE_AUTO_MIGRATE=false` for a serving role that should not issue DDL.
 
-The configuration parser fails closed. Malformed booleans or durations, short secrets, wildcard or HTTP production origins, an HTTP production webhook, missing recovery email delivery, and unverified production database TLS stop startup.
+The configuration parser fails closed. Malformed booleans or durations, short or reused production peppers, wildcard or HTTP production origins, an HTTP production webhook, missing recovery email delivery, and unverified production database TLS stop startup. The token, device, issuance, and optional password peppers must all be independently generated in production.
 
 `DENILICENSE_PASSWORD_PEPPER` is optional but, when set, must also be unpadded base64url encoding at least 32 bytes. Rotating it requires a deliberate password-rehash strategy.
 
-Set `DENILICENSE_REGISTRATION_MODE` to `open` or `closed`. Open registration requires a working email webhook, except when development token exposure is explicitly enabled outside production. In either mode, a platform owner can invite an account from the embedded console without assigning a shared temporary password. The invitee chooses their own password with a short-lived, single-use setup token.
+Set `DENILICENSE_REGISTRATION_MODE` to `open` or `closed`. Open registration requires a working email webhook, except when development token exposure is explicitly enabled outside production. Public registration records only an email and a short-lived token; the token holder proves email ownership and chooses the first password atomically. In either mode, a platform owner can invite an account from the embedded console without assigning a shared temporary password. The invitee chooses their own password with a short-lived, single-use setup token.
 
 ## Schema migration
 
@@ -96,6 +134,8 @@ Treat that pepper as non-rotating recovery key material for the current derivati
 ## Email delivery
 
 Verification, password-reset, and owner-created account-setup jobs enter a bounded in-memory queue with 256 slots and two worker threads. Delivery uses a ten-second HTTP timeout, rejects redirects, retries three times with short backoff, and drains until `DENILICENSE_SHUTDOWN_TIMEOUT` during graceful shutdown.
+
+Expired token/session rows are pruned hourly. Abandoned, unverified customer registrations with no license or request references are deleted after 30 days without a fresh registration or verification request; registering the address again restarts that retention window and the email-ownership ceremony.
 
 This keeps authentication responses non-enumerating and independent of provider latency, but it is not durable across process or host failure. Users can request fresh tokens. Deployments requiring guaranteed delivery should use an encrypted transactional outbox or durable provider queue before launch. Alert on queue saturation and final delivery failures without logging raw tokens.
 

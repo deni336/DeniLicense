@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import tomllib
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -130,6 +132,11 @@ def test_ui_redirect_index_and_path_specific_security_policy() -> None:
             params={"token": "x" * 129},
             follow_redirects=False,
         )
+        verification_redirect = client.get(
+            "/verify-email",
+            params={"token": "dlev_example+token/value"},
+            follow_redirects=False,
+        )
         index = client.get("/ui/")
         api = client.get("/live")
         lookalike = client.get("/ui-not-the-console")
@@ -145,6 +152,11 @@ def test_ui_redirect_index_and_path_specific_security_policy() -> None:
     )
     assert reset_redirect.headers["cache-control"] == "no-store"
     assert oversized_reset_redirect.headers["location"] == "/ui/?action=reset-password"
+    assert verification_redirect.status_code == 307
+    assert verification_redirect.headers["location"] == (
+        "/ui/?action=verify-email&token=dlev_example%2Btoken%2Fvalue"
+    )
+    assert verification_redirect.headers["cache-control"] == "no-store"
     assert index.status_code == 200
     assert index.headers["content-type"].startswith("text/html")
     assert index.headers["cache-control"] == "no-store"
@@ -164,14 +176,20 @@ def test_packaged_assets_have_content_type_cache_validation_and_security_headers
     ui = resources.files("denilicense").joinpath("ui")
     asset = next(item for item in _files(ui) if item.name.endswith((".css", ".js")))
     relative = str(asset).replace("\\", "/").split("/ui/", 1)[1]
+    digest = hashlib.sha256(asset.read_bytes()).hexdigest()
 
     with TestClient(_app()) as client:
-        response = client.get(f"/ui/{relative}")
+        index = client.get("/ui/")
+        stable = client.get(f"/ui/{relative}")
+        response = client.get(f"/ui/{relative}?v={digest[:16]}")
         unchanged = client.get(f"/ui/{relative}", headers={"If-None-Match": response.headers["etag"]})
 
+    assert f"/ui/{relative}?v={digest[:16]}" in index.text
+    assert stable.headers["cache-control"] == "public, max-age=0, must-revalidate"
     assert response.status_code == 200
     assert response.headers["content-type"] != "application/octet-stream"
-    assert response.headers["cache-control"].startswith("public, max-age=")
+    assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert response.headers["etag"] == f'"{digest}"'
     assert len(response.headers["etag"]) == 66
     assert response.headers["x-content-type-options"] == "nosniff"
     assert unchanged.status_code == 304
@@ -234,6 +252,109 @@ def test_user_admin_ui_exposes_invites_role_access_and_memory_only_setup_tokens(
     assert "localStorage" not in script
     for unsafe_sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
         assert unsafe_sink not in script
+
+
+def test_ui_routes_and_lifecycle_controls_are_wired_and_discoverable() -> None:
+    ui = resources.files("denilicense").joinpath("ui")
+    html = ui.joinpath("index.html").read_text(encoding="utf-8")
+    script = ui.joinpath("app.js").read_text(encoding="utf-8")
+
+    route_block = re.search(r"const routes = \{(.*?)\n\};", script, re.DOTALL)
+    assert route_block is not None
+    routes = set(re.findall(r"^\s{2}([a-z]+):", route_block.group(1), re.MULTILINE))
+    nav_routes = set(re.findall(r'data-route="([a-z]+)"', html))
+    views = set(re.findall(r'data-view="([a-z]+)"', html))
+    assert routes == nav_routes == views
+    assert 'if (route === "requests") await loadRequests();' in script
+
+    assert 'id="license-lifecycle-console"' in html
+    assert html.count('data-lifecycle-value="archived"') == 2
+    assert html.count('data-lifecycle-value="deleted"') == 2
+    for label in (
+        'makeButton("Resend invite"',
+        'makeButton("Archive"',
+        'makeButton("Restore"',
+        'makeButton("Delete"',
+        'detailSection("Lifecycle management")',
+    ):
+        assert label in script
+
+
+def test_ui_registration_state_transitions_and_accessibility_regressions() -> None:
+    ui = resources.files("denilicense").joinpath("ui")
+    html = ui.joinpath("index.html").read_text(encoding="utf-8")
+    script = ui.joinpath("app.js").read_text(encoding="utf-8")
+    styles = ui.joinpath("app.css").read_text(encoding="utf-8")
+
+    assert 'name="registrationEmail"' in html
+    assert 'name="registrationPassword"' not in html
+    assert 'name="registrationConfirmation"' not in html
+    assert 'id="email-verification-form"' in html
+    assert 'name="newPassword"' in html
+    assert 'name="confirmPassword"' in html
+    assert "body: { email }" in script
+    assert re.search(
+        r"body:\s*\{\s*token:\s*emailVerificationToken,\s*newPassword:\s*password\s*\}",
+        script,
+    )
+    assert "`${API}/auth/verification/request`" in script
+
+    assert "`${API}/activations/${encodeURIComponent(activation.id)}`" in script
+    assert "`${API}/admin/activations/${encodeURIComponent(activation.id)}`" in script
+    assert "revoked: []" in script
+    assert "Revocation is permanent." in script
+    assert "This key is permanently revoked." in script
+
+    assert "location.hash = target;\n      return;" in script
+    for request_name in ("licenses", "requests", "machines", "products", "issuers", "users"):
+        assert f"request !== listRequests.{request_name}" in script
+    assert "function resetLicenseForm()" in script
+    assert 'form.elements.entitlements.value = "{}";' in script
+
+    dialogs = re.findall(r"<dialog\b([^>]*)>", html)
+    assert dialogs
+    assert all("aria-labelledby=" in attributes or "aria-label=" in attributes for attributes in dialogs)
+    assert 'attributes: { scope: "col" }' in script
+    assert 'attributes: { role: "status", "aria-live": "polite", "aria-busy": "true" }' in script
+    assert ":focus-visible" in styles
+    assert "overflow-y: auto" in styles
+    assert ".filter-bar.user-filter-bar { grid-template-columns: 1fr; }" in styles
+
+
+def test_ui_account_security_product_lifecycle_and_revision_guards() -> None:
+    ui = resources.files("denilicense").joinpath("ui")
+    html = ui.joinpath("index.html").read_text(encoding="utf-8")
+    script = ui.joinpath("app.js").read_text(encoding="utf-8")
+
+    for element_id in (
+        "account-security-button",
+        "account-security-dialog",
+        "account-password-form",
+        "account-sessions",
+        "refresh-account-sessions",
+        "revoke-other-sessions",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'aria-labelledby="account-security-title"' in html
+    assert 'autocomplete="current-password"' in html
+    assert html.count('autocomplete="new-password"') >= 2
+    assert "`${API}/auth/sessions`" in script
+    assert "`${API}/auth/password/change`" in script
+    assert "body: { currentPassword, newPassword }" in script
+    assert "`${API}/auth/sessions/revoke-others`" in script
+    assert "`${API}/auth/sessions/${encodeURIComponent(session.id)}`" in script
+    assert 'showLogin("This browser session was revoked.' in script
+
+    management_roles = '"platform_owner", "license_admin", "support", "auditor"'
+    assert f"roles: [{management_roles}]" in script
+    assert 'data-route="products" data-roles="platform_owner,license_admin,support,auditor"' in html
+    assert 'byId("create-product-button").hidden = !isLicenseWriter();' in script
+    assert "if (isManagementReader()) {" in script
+    assert "`${API}/admin/products/${encodeURIComponent(product.code)}/status`" in script
+    assert "body: { status, expectedRevision }" in script
+    assert "body: { role, status, expectedRevision: user.revision }" in script
+    assert "await loadProductsPage();" in script
+    assert 'href="/docs/entitlements"' in html
 
 
 def test_management_dashboard_routes_and_activation_filters() -> None:

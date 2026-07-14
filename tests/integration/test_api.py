@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -131,6 +130,8 @@ def test_end_to_end_licensing_flow() -> None:
             },
         )
         require_status(response, 201)
+        created_product = response.json()["product"]
+        assert created_product["revision"] == 1
 
         expires_at = datetime.now(UTC) + timedelta(hours=24)
         online_request = {
@@ -288,20 +289,130 @@ def test_end_to_end_licensing_flow() -> None:
         response = client.request(
             "POST",
             "/api/v1/auth/register",
-            body={"email": customer_email, "password": customer_password},
+            body={"email": customer_email},
+        )
+        require_status(response, 202)
+        first_verification_token = response.json().get("developmentVerificationToken", "")
+        assert first_verification_token, "development verification token missing"
+
+        response = client.request(
+            "POST",
+            "/api/v1/auth/register",
+            body={"email": customer_email},
         )
         require_status(response, 202)
         verification_token = response.json().get("developmentVerificationToken", "")
-        assert verification_token, "development verification token missing"
+        assert verification_token and verification_token != first_verification_token
 
         response = client.request(
             "POST",
             "/api/v1/auth/verify-email",
-            body={"token": verification_token},
+            body={
+                "token": first_verification_token,
+                "newPassword": "attacker selected password is rejected",
+            },
+        )
+        require_status(response, 400)
+        assert response.json()["code"] == "invalid_request"
+
+        response = client.request(
+            "GET",
+            f"/api/v1/admin/users?email={quote(customer_email)}",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        pending_customer = response.json()["items"][0]
+        assert pending_customer["role"] == "customer"
+        assert pending_customer["emailVerifiedAt"] is None
+        assert pending_customer["passwordSetupRequired"] is True
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/users/{pending_customer['id']}/access",
+            bearer=owner_access,
+            body={
+                "role": "auditor",
+                "status": "active",
+                "expectedRevision": pending_customer["revision"],
+            },
+        )
+        require_status(response, 409)
+
+        response = client.request(
+            "POST",
+            "/api/v1/auth/verify-email",
+            body={"token": verification_token, "newPassword": customer_password},
         )
         require_status(response, 200)
         customer = login(client, customer_email, customer_password)
         customer_access = customer["accessToken"]
+
+        license_request_body = {
+            "productCode": product_code,
+            "requestedActivations": 2,
+            "message": "Two integration workstations",
+        }
+        response = client.request(
+            "POST",
+            "/api/v1/license-requests",
+            bearer=customer_access,
+            body=license_request_body,
+        )
+        require_status(response, 201)
+        cancelled_request_id = response.json()["request"]["id"]
+        response = client.request(
+            "POST",
+            f"/api/v1/license-requests/{cancelled_request_id}/cancel",
+            bearer=customer_access,
+        )
+        require_status(response, 200)
+        assert response.json()["request"]["status"] == "cancelled"
+
+        response = client.request(
+            "POST",
+            "/api/v1/license-requests",
+            bearer=customer_access,
+            body=license_request_body,
+        )
+        require_status(response, 201)
+        license_request_id = response.json()["request"]["id"]
+        approval_body = {
+            "subject": "request-integration",
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=24)).isoformat(),
+            "maxActivations": 2,
+            "offlineGraceSeconds": 86_400,
+            "perpetual": False,
+            "entitlements": {"feature.requested": True, "limits.projects": 20},
+        }
+        approval_path = f"/api/v1/admin/license-requests/{license_request_id}/approve"
+        response = client.request(
+            "POST",
+            approval_path,
+            bearer=owner_access,
+            body=approval_body,
+        )
+        require_status(response, 201)
+        fulfilled = response.json()
+        requested_license_id = fulfilled["license"]["id"]
+        assert fulfilled["request"]["status"] == "fulfilled"
+        assert fulfilled["license"]["ownerUserId"] == customer["user"]["id"]
+        assert "claimCode" not in fulfilled
+
+        response = client.request(
+            "POST",
+            approval_path,
+            bearer=owner_access,
+            body=approval_body,
+        )
+        require_status(response, 200)
+        assert response.json()["idempotent"] is True
+        assert response.json()["license"]["id"] == requested_license_id
+
+        response = client.request("GET", "/api/v1/license-requests", bearer=customer_access)
+        require_status(response, 200)
+        assert contains_id(response.json()["items"], license_request_id)
+        response = client.request("GET", "/api/v1/licenses", bearer=customer_access)
+        require_status(response, 200)
+        assert contains_id(response.json()["items"], requested_license_id)
 
         response = client.request(
             "POST",
@@ -446,14 +557,63 @@ def test_end_to_end_licensing_flow() -> None:
         assert managed_setup_token
         managed_id = managed["user"]["id"]
 
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/users/{managed_id}/invitation/resend",
+            bearer=owner_access,
+        )
+        require_status(response, 202)
+        resent_setup_token = response.json().get("developmentPasswordResetToken")
+        assert resent_setup_token and resent_setup_token != managed_setup_token
+
         managed_password = "managed admin correct horse password"  # noqa: S105 - test fixture
         response = client.request(
             "POST",
             "/api/v1/auth/password-reset/confirm",
             body={"token": managed_setup_token, "newPassword": managed_password},
         )
+        require_status(response, 400)
+        response = client.request(
+            "POST",
+            "/api/v1/auth/password-reset/confirm",
+            body={"token": resent_setup_token, "newPassword": managed_password},
+        )
         require_status(response, 204)
         managed_session = login(client, managed_email, managed_password)
+        managed_other_session = login(client, managed_email, managed_password)
+        response = client.request(
+            "GET",
+            "/api/v1/auth/sessions",
+            bearer=managed_session["accessToken"],
+        )
+        require_status(response, 200)
+        account_sessions = response.json()["items"]
+        assert len(account_sessions) >= 2
+        assert sum(bool(item["isCurrent"]) for item in account_sessions) == 1
+        response = client.request(
+            "POST",
+            "/api/v1/auth/sessions/revoke-others",
+            bearer=managed_session["accessToken"],
+        )
+        require_status(response, 204)
+        response = client.request(
+            "GET",
+            "/api/v1/auth/me",
+            bearer=managed_other_session["accessToken"],
+        )
+        require_status(response, 401)
+        changed_managed_password = "managed administrator replacement password"  # noqa: S105
+        response = client.request(
+            "POST",
+            "/api/v1/auth/password/change",
+            bearer=managed_session["accessToken"],
+            body={
+                "currentPassword": managed_password,
+                "newPassword": changed_managed_password,
+            },
+        )
+        require_status(response, 204)
+        managed_password = changed_managed_password
         response = client.request(
             "GET",
             "/api/v1/admin/dashboard",
@@ -488,15 +648,30 @@ def test_end_to_end_licensing_flow() -> None:
             "POST",
             f"/api/v1/admin/users/{owner_users[0]['id']}/access",
             bearer=owner_access,
-            body={"role": "platform_owner", "status": "disabled"},
+            body={
+                "role": "platform_owner",
+                "status": "disabled",
+                "expectedRevision": owner_users[0]["revision"],
+            },
         )
         require_status(response, 409)
 
         response = client.request(
+            "GET",
+            f"/api/v1/admin/users/{managed_id}",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        managed_before_access_change = response.json()["user"]
+        response = client.request(
             "POST",
             f"/api/v1/admin/users/{managed_id}/access",
             bearer=owner_access,
-            body={"role": "auditor", "status": "active"},
+            body={
+                "role": "auditor",
+                "status": "active",
+                "expectedRevision": managed_before_access_change["revision"],
+            },
         )
         require_status(response, 200)
         assert response.json()["user"]["role"] == "auditor"
@@ -612,9 +787,182 @@ def test_end_to_end_licensing_flow() -> None:
         )
         require_status(response, 409)
 
-        # The intentionally small login bucket needs time to refill before the
-        # refresh-family checks so rate limiting cannot mask token reuse behavior.
-        time.sleep(7)
+        response = client.request(
+            "GET",
+            f"/api/v1/admin/licenses/{claimed_license_id}",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        revoked_license = response.json()["license"]
+        assert revoked_license["state"] == "revoked"
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/licenses/{claimed_license_id}/archive",
+            bearer=owner_access,
+            body={"expectedRevision": revoked_license["revision"]},
+        )
+        require_status(response, 200)
+        archived_license = response.json()["license"]
+        assert archived_license["archivedAt"]
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/licenses/{claimed_license_id}/delete",
+            bearer=owner_access,
+            body={
+                "serial": archived_license["serial"],
+                "expectedRevision": archived_license["revision"],
+            },
+        )
+        require_status(response, 204)
+        response = client.request(
+            "GET",
+            f"/api/v1/licenses/{claimed_license_id}",
+            bearer=customer_access,
+        )
+        require_status(response, 404)
+        response = client.request(
+            "GET",
+            f"/api/v1/admin/licenses?lifecycle=deleted&serial={archived_license['serial']}",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        assert contains_id(response.json()["items"], claimed_license_id)
+        response = client.request(
+            "GET",
+            f"/api/v1/admin/licenses/{claimed_license_id}/activations",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        assert response.json()["items"]
+        response = client.request(
+            "POST",
+            "/api/v1/admin/licenses/import",
+            bearer=owner_access,
+            body={"artifact": artifact},
+        )
+        require_status(response, 409)
+
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/licenses/{requested_license_id}/state",
+            bearer=owner_access,
+            body={"state": "revoked"},
+        )
+        require_status(response, 204)
+        response = client.request(
+            "GET",
+            f"/api/v1/admin/licenses/{requested_license_id}",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        requested_license = response.json()["license"]
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/licenses/{requested_license_id}/archive",
+            bearer=owner_access,
+            body={"expectedRevision": requested_license["revision"]},
+        )
+        require_status(response, 200)
+        requested_license = response.json()["license"]
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/licenses/{requested_license_id}/delete",
+            bearer=owner_access,
+            body={
+                "serial": requested_license["serial"],
+                "expectedRevision": requested_license["revision"],
+            },
+        )
+        require_status(response, 204)
+        response = client.request(
+            "POST",
+            approval_path,
+            bearer=owner_access,
+            body=approval_body,
+        )
+        require_status(response, 409)
+
+        response = client.request(
+            "GET",
+            f"/api/v1/admin/users/{managed_id}",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        managed_record = response.json()["user"]
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/users/{managed_id}/archive",
+            bearer=owner_access,
+            body={"expectedRevision": managed_record["revision"]},
+        )
+        require_status(response, 200)
+        archived_user = response.json()["user"]
+        assert archived_user["status"] == "disabled"
+        response = client.request("GET", "/api/v1/auth/me", bearer=auditor_access)
+        require_status(response, 401)
+        response = client.request(
+            "POST",
+            f"/api/v1/admin/users/{managed_id}/delete",
+            bearer=owner_access,
+            body={"email": managed_email, "expectedRevision": archived_user["revision"]},
+        )
+        require_status(response, 204)
+        response = client.request(
+            "GET",
+            f"/api/v1/admin/users/{managed_id}",
+            bearer=owner_access,
+        )
+        require_status(response, 200)
+        deleted_user = response.json()["user"]
+        assert deleted_user["deletedAt"]
+        assert deleted_user["email"] != managed_email
+        response = client.request(
+            "POST",
+            "/api/v1/auth/register",
+            body={"email": managed_email},
+        )
+        require_status(response, 202)
+        assert response.json().get("developmentVerificationToken")
+
+        product_status_path = f"/api/v1/admin/products/{product_code}/status"
+        response = client.request(
+            "POST",
+            product_status_path,
+            bearer=owner_access,
+            body={"status": "retired", "expectedRevision": created_product["revision"]},
+        )
+        require_status(response, 200)
+        retired_product = response.json()["product"]
+        assert retired_product["status"] == "retired"
+        response = client.request("GET", "/api/v1/products")
+        require_status(response, 200)
+        assert all(item["code"] != product_code for item in response.json()["items"])
+        response = client.request(
+            "POST",
+            "/api/v1/admin/licenses",
+            bearer=owner_access,
+            headers={"Idempotency-Key": idempotency_key},
+            body=online_request,
+        )
+        require_status(response, 200)
+        assert response.json()["license"]["id"] == online_created["license"]["id"]
+        response = client.request(
+            "POST",
+            "/api/v1/admin/licenses",
+            bearer=owner_access,
+            headers={"Idempotency-Key": f"retired-{unique.lower()}"},
+            body=online_request,
+        )
+        require_status(response, 409)
+        response = client.request(
+            "POST",
+            product_status_path,
+            bearer=owner_access,
+            body={"status": "active", "expectedRevision": retired_product["revision"]},
+        )
+        require_status(response, 200)
+        assert response.json()["product"]["status"] == "active"
+
         response = client.request(
             "POST",
             "/api/v1/auth/refresh",

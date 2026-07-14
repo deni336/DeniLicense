@@ -9,7 +9,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 MIGRATION_LOCK = 1_947_259_831
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]+)_.+\.sql$")
@@ -59,10 +59,19 @@ def open_pool(database_url: str, *, min_size: int = 2, max_size: int = 20) -> Co
         max_lifetime=3600,
         max_idle=900,
         check=ConnectionPool.check_connection,
-        kwargs={"row_factory": dict_row},
+        # Bound each libpq attempt below the pool shutdown timeout so an
+        # unreachable database cannot strand connection-worker threads.
+        kwargs={"row_factory": dict_row, "connect_timeout": 5},
         open=True,
     )
-    pool.wait(timeout=10)
+    try:
+        pool.wait(timeout=10)
+    except PoolTimeout as exc:
+        pool.close()
+        raise RuntimeError(
+            "PostgreSQL did not become reachable within 10 seconds; verify "
+            "DENILICENSE_DATABASE_URL and start the database"
+        ) from exc
     return pool
 
 

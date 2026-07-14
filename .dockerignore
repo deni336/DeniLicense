@@ -9,7 +9,6 @@ build
 dist
 coverage
 data
-docs
 secrets
 .env*
 *.dlicense

@@ -7,6 +7,7 @@ import pytest
 
 from denilicense.crypto.claim_code import digest, from_entropy, parse
 from denilicense.crypto.common import (
+    InvalidClaims,
     InvalidPublicKey,
     b64url_encode,
     format_rfc3339_preserving,
@@ -97,6 +98,15 @@ def test_go_map_order_and_nanosecond_times_remain_canonical() -> None:
     assert b'"entitlements":{"a-first":1,"z-last":true}' in claims.canonical_json()
     raw = "2026-01-02T03:04:05.123456789Z"
     assert format_rfc3339_preserving(parse_rfc3339(raw), raw) == raw
+
+
+def test_entitlement_snapshot_has_a_lease_safe_canonical_size_limit() -> None:
+    key = SigningKey.from_seed(bytes(range(32)), OFFLINE_LICENSE_ISSUER)
+    claims = _claims(key)
+    oversized = {f"feature.value_{index}": "x" * 3_500 for index in range(4)}
+    with pytest.raises(InvalidClaims, match="12288 bytes"):
+        claims.entitlements = oversized
+        claims.validate()
 
 
 def test_license_rejects_noncanonical_and_tampered_tokens() -> None:

@@ -41,6 +41,9 @@ where = ["src"]
 [tool.setuptools.package-data]
 denilicense = ["migrations/*.sql", "ui/*", "ui/**/*"]
 
+[tool.setuptools.data-files]
+"share/denilicense/docs" = ["docs/ENTITLEMENTS.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-config --strict-markers --import-mode=importlib"

@@ -72,6 +72,18 @@ def _secret(name: str, *, optional: bool = False) -> bytes:
     return decoded
 
 
+def _require_independent_secrets(secrets: dict[str, bytes]) -> None:
+    """Reject production deployments that reuse one secret for several purposes."""
+
+    configured = [(name, value) for name, value in secrets.items() if value]
+    for index, (left_name, left_value) in enumerate(configured):
+        for right_name, right_value in configured[index + 1 :]:
+            if left_value == right_value:
+                raise ConfigurationError(
+                    f"{left_name} and {right_name} must use independent values in production"
+                )
+
+
 def _service_url(name: str, value: str, *, production: bool) -> str:
     parsed = urlparse(value)
     if (
@@ -223,15 +235,28 @@ class Settings:
         )
         if len(verification_files) > 32:
             raise ConfigurationError("at most 32 activation verification keys may be configured")
+        token_pepper = _secret("DENILICENSE_TOKEN_PEPPER")
+        device_pepper = _secret("DENILICENSE_DEVICE_PEPPER")
+        issuance_pepper = _secret("DENILICENSE_ISSUANCE_PEPPER")
+        password_pepper = _secret("DENILICENSE_PASSWORD_PEPPER", optional=True)
+        if production:
+            _require_independent_secrets(
+                {
+                    "DENILICENSE_TOKEN_PEPPER": token_pepper,
+                    "DENILICENSE_DEVICE_PEPPER": device_pepper,
+                    "DENILICENSE_ISSUANCE_PEPPER": issuance_pepper,
+                    "DENILICENSE_PASSWORD_PEPPER": password_pepper,
+                }
+            )
         return cls(
             environment=environment,
             http_host=host or "0.0.0.0",  # noqa: S104 - container listener is intentionally configurable
             http_port=port,
             database_url=database_url,
-            token_pepper=_secret("DENILICENSE_TOKEN_PEPPER"),
-            device_pepper=_secret("DENILICENSE_DEVICE_PEPPER"),
-            issuance_pepper=_secret("DENILICENSE_ISSUANCE_PEPPER"),
-            password_pepper=_secret("DENILICENSE_PASSWORD_PEPPER", optional=True),
+            token_pepper=token_pepper,
+            device_pepper=device_pepper,
+            issuance_pepper=issuance_pepper,
+            password_pepper=password_pepper,
             access_token_ttl=access_ttl,
             refresh_token_ttl=refresh_ttl,
             verification_ttl=verification_ttl,

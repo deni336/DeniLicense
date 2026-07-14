@@ -15,9 +15,11 @@ from denilicense.domain import (
     UnauthorizedError,
 )
 from denilicense.store import (
+    PENDING_REGISTRATION_PASSWORD_HASH,
     ActivateParams,
     AuditEvent,
     CreateManagedUserParams,
+    RegisterPendingUserParams,
     RotateSessionParams,
     Store,
     UpdateUserAccessParams,
@@ -88,14 +90,20 @@ def user_row(
     email="owner@example.com",
     role="platform_owner",
     status="active",
+    verified=True,
+    password_set=True,
 ):
     return {
         "id": user_id,
         "email": email,
         "role": role,
         "status": status,
-        "email_verified_at": NOW,
+        "email_verified_at": NOW if verified else None,
         "created_at": NOW,
+        "password_set_at": NOW if password_set else None,
+        "archived_at": None,
+        "deleted_at": None,
+        "revision": 1,
     }
 
 
@@ -123,6 +131,130 @@ def license_row(license_id, owner_id):
         "created_at": NOW,
         "updated_at": NOW,
     }
+
+
+def test_duplicate_pending_registration_neutralizes_password_and_rotates_token():
+    user_id, token_id = uuid4(), uuid4()
+    expires_at = NOW + timedelta(minutes=30)
+    connection = ScriptedConnection(
+        [
+            ("ON CONFLICT (normalized_email) DO NOTHING", Result(one=None)),
+            (
+                "FROM users WHERE normalized_email=%s FOR UPDATE",
+                Result(
+                    one={
+                        **user_row(
+                            user_id,
+                            email="victim@example.com",
+                            role="customer",
+                            verified=False,
+                        ),
+                        "password_set_at": NOW,
+                    }
+                ),
+            ),
+            ("UPDATE users SET password_hash=%s", Result()),
+            ("UPDATE sessions SET revoked_at", Result(rowcount=1)),
+            ("DELETE FROM password_reset_tokens", Result()),
+            ("DELETE FROM email_verification_tokens", Result(rowcount=1)),
+            ("INSERT INTO email_verification_tokens", Result()),
+        ]
+    )
+
+    recipient, pending = Store(FakePool(connection)).register_pending_user(
+        RegisterPendingUserParams(
+            id=uuid4(),
+            email="victim@example.com",
+            normalized_email="victim@example.com",
+            verification_token_id=token_id,
+            verification_token_hash=b"v" * 32,
+            verification_token_expiry=expires_at,
+        )
+    )
+
+    assert (recipient, pending) == ("victim@example.com", True)
+    assert connection.sql[2][1] == (PENDING_REGISTRATION_PASSWORD_HASH, user_id)
+    assert connection.sql[5][1] == (user_id,)
+    assert connection.sql[6][1] == (token_id, user_id, b"v" * 32, expires_at)
+    assert connection.commits == 1
+    assert not connection.script
+
+
+def test_verification_atomically_installs_first_password_and_revokes_legacy_sessions():
+    user_id = uuid4()
+    completed = {
+        **user_row(user_id, email="victim@example.com", role="customer"),
+        "revision": 2,
+    }
+    connection = ScriptedConnection(
+        [
+            ("FROM email_verification_tokens WHERE token_hash", Result(one={"user_id": user_id})),
+            ("email_verified_at IS NULL", Result(one={"id": user_id})),
+            ("UPDATE email_verification_tokens SET consumed_at", Result(one={"id": uuid4()})),
+            ("UPDATE users SET password_hash=%s", Result(one=completed)),
+            ("UPDATE email_verification_tokens SET consumed_at", Result()),
+            ("DELETE FROM password_reset_tokens", Result()),
+            ("UPDATE sessions SET revoked_at", Result(rowcount=1)),
+            ("INSERT INTO audit_events", Result()),
+        ]
+    )
+
+    verified = Store(FakePool(connection)).verify_email(
+        b"t" * 32,
+        "hashed:victim-selected-password",
+        NOW,
+    )
+
+    assert verified.email_verified_at == NOW
+    assert verified.password_setup_required is False
+    assert connection.sql[3][1] == (
+        "hashed:victim-selected-password",
+        NOW,
+        NOW,
+        NOW,
+        user_id,
+    )
+    assert connection.sql[6][1] == (NOW, user_id)
+    assert connection.commits == 1
+    assert not connection.script
+
+
+def test_unverified_customer_cannot_be_promoted_to_a_privileged_role():
+    actor_id, pending_id = uuid4(), uuid4()
+    connection = ScriptedConnection(
+        [
+            ("pg_advisory_xact_lock", Result()),
+            (
+                "SELECT role, status FROM users",
+                Result(one={"role": "platform_owner", "status": "active"}),
+            ),
+            (
+                "FROM users WHERE id=%s FOR UPDATE",
+                Result(
+                    one=user_row(
+                        pending_id,
+                        email="victim@example.com",
+                        role="customer",
+                        verified=False,
+                        password_set=False,
+                    )
+                ),
+            ),
+        ]
+    )
+
+    with pytest.raises(ConflictError, match="email verification"):
+        Store(FakePool(connection)).update_user_access(
+            UpdateUserAccessParams(
+                user_id=pending_id,
+                actor_user_id=actor_id,
+                role=Role.AUDITOR,
+                status="active",
+            )
+        )
+
+    assert connection.rollbacks == 1
+    assert not connection.script
 
 
 def test_refresh_reuse_revokes_family_and_commits_before_error():

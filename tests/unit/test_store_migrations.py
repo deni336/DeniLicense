@@ -4,7 +4,9 @@ from contextlib import nullcontext
 from hashlib import sha256
 
 import pytest
+from psycopg_pool import PoolTimeout
 
+import denilicense.database as database
 from denilicense.database import migration_catalog, verify_migrations
 
 
@@ -38,6 +40,34 @@ class VerifyPool:
 
     def connection(self):
         return nullcontext(self.value)
+
+
+class UnavailablePool:
+    instance = None
+
+    def __init__(self, **_kwargs):
+        self.closed = False
+        type(self).instance = self
+
+    @staticmethod
+    def check_connection(_connection):
+        pass
+
+    def wait(self, *, timeout):
+        assert timeout == 10
+        raise PoolTimeout("test database unavailable")
+
+    def close(self):
+        self.closed = True
+
+
+def test_open_pool_translates_timeout_and_closes_workers(monkeypatch):
+    monkeypatch.setattr(database, "ConnectionPool", UnavailablePool)
+
+    with pytest.raises(RuntimeError, match="PostgreSQL did not become reachable"):
+        database.open_pool("postgresql://user:password@localhost/database")
+
+    assert UnavailablePool.instance.closed is True
 
 
 def test_catalog_normalizes_line_endings_before_checksum(tmp_path):
@@ -75,3 +105,18 @@ def test_verify_migrations_performs_no_ddl(tmp_path):
 
     assert connection.statements
     assert all(statement.startswith("SELECT ") for statement in connection.statements)
+
+
+def test_email_first_migration_neutralizes_unverified_credentials_and_enforces_invariants():
+    migration = next(item for item in migration_catalog() if item.version == 3)
+    sql = migration.sql.decode("utf-8")
+
+    assert migration.filename == "003_email_first_registration.sql"
+    assert "UPDATE sessions s" in sql
+    assert "u.email_verified_at IS NULL" in sql
+    assert "DELETE FROM password_reset_tokens" in sql
+    assert "password_hash = '!pending-registration-v1'" in sql
+    assert "password_set_at = NULL" in sql
+    assert "role = 'customer'" in sql
+    assert "users_unverified_role_check" in sql
+    assert "users_unverified_credential_check" in sql

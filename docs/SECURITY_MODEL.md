@@ -28,6 +28,7 @@ None is accepted in place of another. Possessing a license does not authenticate
 - **Access, refresh, email, and reset tokens:** random opaque values; only domain-separated HMACs are persisted.
 - **Claim codes and challenge nonces:** random; only digests are persisted. Claim-code plaintext is not stored.
 - **Issuance pepper:** recovery-critical secret used to reproduce retry-safe online issuance responses. It must be backed up and versioned rather than rotated in place.
+- **Secret separation:** production startup rejects reuse across token, device, issuance, and optional password peppers so compromise of one purpose does not silently collapse every keyed boundary.
 - **Public keys:** canonical 32-byte Ed25519 keys with explicit purpose and key ID. Unsafe identity and low-order points are rejected.
 
 ## Cryptographic formats
@@ -52,8 +53,11 @@ Cryptographic verification does not make an untrusted claim true outside its con
 - Leases bind issuer, product, license revision, activation, entitlements, device-key thumbprint, and a finite validity interval.
 - Lease expiry is capped by server policy, per-license offline grace, and license expiry.
 - Refresh-token rotation retains consumed hashes. Reuse revokes the entire session family.
+- Authenticated users can inspect active sessions and revoke one or all other sessions. Password changes revoke every other session and outstanding reset link while preserving only the session that proved the current password.
+- Public registration is email-first: pending records contain no usable caller-selected password, and the single-use verification-token holder installs the first password in the same transaction that verifies the email.
 - Owner-created accounts use a single-use password-setup token; the owner never selects or receives the invitee's password.
 - User role or status changes are atomic and revoke that user's sessions. The transaction rechecks the acting owner's current authority, rejects self-demotion or self-disablement, and prevents removal of the final active platform owner.
+- Product retirement and reactivation use optimistic revisions and transactional administrator rechecks. Retirement blocks new requests, imports, and online issuance while preserving already-issued license verification and renewal behavior.
 - Audit records are written in the same transaction as security-sensitive state changes where the store operation supports them.
 
 ## Account and API protections

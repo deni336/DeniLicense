@@ -30,6 +30,7 @@ class InvalidPublicKey(DeniLicenseError):
 
 
 _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+MAX_ENTITLEMENTS_JSON_BYTES = 12 * 1024
 _P = (1 << 255) - 19
 _D = (-121665 * pow(121666, -1, _P)) % _P
 _L = (1 << 252) + 27742317777372353535851937790883648493
@@ -231,6 +232,9 @@ def validate_entitlements(value: Any) -> dict[str, bool | str | int]:
         else:
             raise InvalidClaims(f"entitlements.{name} must be a boolean, string, or signed 64-bit integer")
         result[name] = item
+    encoded = canonical_json({name: result[name] for name in sorted(result)})
+    if len(encoded) > MAX_ENTITLEMENTS_JSON_BYTES:
+        raise InvalidClaims(f"entitlements must encode to at most {MAX_ENTITLEMENTS_JSON_BYTES} bytes")
     return result
 
 

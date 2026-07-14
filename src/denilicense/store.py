@@ -22,6 +22,7 @@ from psycopg_pool import ConnectionPool
 
 from .database import migrate, ping, verify_migrations
 from .domain import (
+    AccountSession,
     Activation,
     AdminActivation,
     AuditEvent,
@@ -31,6 +32,7 @@ from .domain import (
     InvalidError,
     IssuerKey,
     License,
+    LicenseRequest,
     LicenseStateError,
     NotFoundError,
     Principal,
@@ -47,16 +49,20 @@ from .domain import (
 UTC = UTC
 OWNER_MANAGEMENT_LOCK = 1_947_259_832
 CLEANUP_BATCH_SIZE = 1_000
+PENDING_REGISTRATION_RETENTION = timedelta(days=30)
+PENDING_REGISTRATION_PASSWORD_HASH = "!pending-registration-v1"  # noqa: S105 - invalid sentinel
 VALID_ROLES = frozenset(Role)
+VALID_LIFECYCLES = frozenset({"current", "archived", "deleted", "all"})
+VALID_LICENSE_REQUEST_STATUSES = frozenset({"pending", "approved", "denied", "cancelled", "fulfilled"})
+
+SESSION_SELECT = "id, created_at, last_seen_at, access_expires_at, refresh_expires_at"
 
 
 @dataclass(frozen=True, slots=True)
-class CreateUserParams:
+class RegisterPendingUserParams:
     id: UUID
     email: str
     normalized_email: str
-    password_hash: str
-    role: Role
     verification_token_id: UUID
     verification_token_hash: bytes
     verification_token_expiry: datetime
@@ -152,6 +158,26 @@ class CreateLicenseParams:
 
 
 @dataclass(frozen=True, slots=True)
+class ResendPasswordSetupParams:
+    user_id: UUID
+    actor_user_id: UUID
+    token_id: UUID
+    token_hash: bytes
+    expires_at: datetime
+    audit: AuditEvent
+
+
+@dataclass(frozen=True, slots=True)
+class CreateLicenseRequestParams:
+    id: UUID
+    requester_user_id: UUID
+    product_id: UUID
+    requested_activations: int
+    message: str
+    audit: AuditEvent
+
+
+@dataclass(frozen=True, slots=True)
 class ActivateParams:
     id: UUID
     license_id: UUID
@@ -169,6 +195,7 @@ class UpdateUserAccessParams:
     actor_user_id: UUID
     role: Role | None = None
     status: str | None = None
+    expected_revision: int | None = None
     audit: AuditEvent = field(default_factory=lambda: AuditEvent("user.access_update", "user"))
 
 
@@ -179,6 +206,15 @@ class LicenseListFilter:
     claim_code_suffix: str = ""
     product_code: str = ""
     state: str = ""
+    limit: int = 100
+    lifecycle: str = "current"
+
+
+@dataclass(frozen=True, slots=True)
+class LicenseRequestListFilter:
+    status: str = ""
+    requester_normalized_email: str = ""
+    product_code: str = ""
     limit: int = 100
 
 
@@ -217,7 +253,29 @@ def _hash32(value: bytes, name: str) -> bytes:
     return value
 
 
+def _lifecycle_predicate(alias: str, lifecycle: str) -> str:
+    if lifecycle not in VALID_LIFECYCLES:
+        raise InvalidError("invalid lifecycle filter")
+    return {
+        "current": f"{alias}.archived_at IS NULL AND {alias}.deleted_at IS NULL",
+        "archived": f"{alias}.archived_at IS NOT NULL AND {alias}.deleted_at IS NULL",
+        "deleted": f"{alias}.deleted_at IS NOT NULL",
+        "all": "TRUE",
+    }[lifecycle]
+
+
+def _clean_request_text(value: str, name: str, limit: int = 2_000) -> str:
+    cleaned = value.strip()
+    if len(cleaned) > limit:
+        raise InvalidError(f"{name} is too long")
+    if any((ord(char) < 32 and char not in "\t\r\n") or ord(char) == 127 for char in cleaned):
+        raise InvalidError(f"{name} contains control characters")
+    return cleaned
+
+
 def _user(row: Mapping[str, Any]) -> User:
+    password_set_at = row.get("password_set_at") if "password_set_at" in row else "legacy"
+    deleted_at = row.get("deleted_at")
     return User(
         id=row["id"],
         email=row["email"],
@@ -225,6 +283,10 @@ def _user(row: Mapping[str, Any]) -> User:
         status=row["status"],
         email_verified_at=row["email_verified_at"],
         created_at=row["created_at"],
+        password_setup_required=password_set_at is None and deleted_at is None,
+        archived_at=row.get("archived_at"),
+        deleted_at=deleted_at,
+        revision=int(row.get("revision", 1)),
     )
 
 
@@ -245,7 +307,12 @@ def _issuer(row: Mapping[str, Any]) -> IssuerKey:
 
 
 def _license(row: Mapping[str, Any]) -> License:
-    return License(**{name: row[name] for name in License.__dataclass_fields__})
+    values = {name: row[name] for name in License.__dataclass_fields__ if name in row}
+    return License(**values)
+
+
+def _license_request(row: Mapping[str, Any]) -> LicenseRequest:
+    return LicenseRequest(**{name: row[name] for name in LicenseRequest.__dataclass_fields__})
 
 
 def _activation(row: Mapping[str, Any]) -> Activation:
@@ -260,8 +327,11 @@ def _admin_activation(row: Mapping[str, Any]) -> AdminActivation:
     return AdminActivation(**values)
 
 
-USER_SELECT = "id, email, role, status, email_verified_at, created_at"
-PRODUCT_SELECT = "id, code, name, description, status, created_at, updated_at"
+USER_SELECT = (
+    "id, email, role, status, email_verified_at, created_at, "
+    "password_set_at, archived_at, deleted_at, revision"
+)
+PRODUCT_SELECT = "id, code, name, description, status, created_at, updated_at, revision"
 ACTIVATION_SELECT = (
     "id, license_id, device_key_thumbprint, label, state, "
     "activated_at, last_seen_at, lease_expires_at, deactivated_at"
@@ -272,10 +342,20 @@ LICENSE_SELECT = """
            l.source, l.state, l.subject, l.issued_at, l.not_before, l.expires_at,
            l.max_activations, l.offline_grace_seconds, l.entitlements, l.metadata,
            l.revision, l.claim_code_suffix, l.claim_consumed_at AS claimed_at,
-           l.created_at, l.updated_at
+           l.created_at, l.updated_at, l.archived_at, l.deleted_at
     FROM licenses l
     JOIN products p ON p.id = l.product_id
     LEFT JOIN users u ON u.id = l.owner_user_id
+"""
+LICENSE_REQUEST_SELECT = """
+    SELECT r.id, r.requester_user_id, u.email AS requester_email,
+           r.product_id, p.code AS product_code, p.name AS product_name,
+           r.requested_activations, r.message, r.status, r.admin_notes,
+           r.reviewed_by, r.reviewed_at, r.fulfilled_license_id,
+           r.created_at, r.updated_at
+    FROM license_requests r
+    JOIN users u ON u.id = r.requester_user_id
+    JOIN products p ON p.id = r.product_id
 """
 
 
@@ -295,37 +375,76 @@ class Store:
     def verify_migrations(self) -> None:
         verify_migrations(self.pool)
 
-    def create_user(self, params: CreateUserParams) -> User:
+    def register_pending_user(self, params: RegisterPendingUserParams) -> tuple[str, bool]:
+        """Create or safely rotate an email-first customer registration.
+
+        A public registration never persists a caller-selected credential. The
+        verification token holder establishes the first usable password when
+        completing verification. Re-registering an existing pending address
+        invalidates every older verification token under the user row lock.
+        """
+
         token_hash = _hash32(params.verification_token_hash, "verification token hash")
+        expires_at = _utc(params.verification_token_expiry)
         try:
             with self.pool.connection() as conn, conn.transaction():
-                row = conn.execute(
-                    f"""
-                    INSERT INTO users (id, email, normalized_email, password_hash, role)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING {USER_SELECT}
+                inserted = conn.execute(
+                    """
+                    INSERT INTO users
+                        (id, email, normalized_email, password_hash, role, password_set_at)
+                    VALUES (%s, %s, %s, %s, 'customer', NULL)
+                    ON CONFLICT (normalized_email) DO NOTHING
+                    RETURNING id
                     """,
                     (
                         params.id,
                         params.email,
                         params.normalized_email,
-                        params.password_hash,
-                        params.role.value,
+                        PENDING_REGISTRATION_PASSWORD_HASH,
                     ),
                 ).fetchone()
+                row = conn.execute(
+                    """SELECT id, email, role, status, email_verified_at,
+                              password_set_at, archived_at, deleted_at
+                       FROM users WHERE normalized_email=%s FOR UPDATE""",
+                    (params.normalized_email,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("pending registration insert could not be read back")
+                if (
+                    row["role"] != Role.CUSTOMER.value
+                    or row["status"] != "active"
+                    or row["email_verified_at"] is not None
+                    or row["archived_at"] is not None
+                    or row["deleted_at"] is not None
+                ):
+                    return "", False
+                if inserted is None:
+                    conn.execute(
+                        """UPDATE users SET password_hash=%s, password_set_at=NULL,
+                                  revision=revision+1, updated_at=clock_timestamp()
+                           WHERE id=%s""",
+                        (PENDING_REGISTRATION_PASSWORD_HASH, row["id"]),
+                    )
+                conn.execute(
+                    "UPDATE sessions SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE user_id=%s",
+                    (row["id"],),
+                )
+                conn.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (row["id"],))
+                conn.execute("DELETE FROM email_verification_tokens WHERE user_id=%s", (row["id"],))
                 conn.execute(
                     """INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at)
                        VALUES (%s, %s, %s, %s)""",
                     (
                         params.verification_token_id,
-                        params.id,
+                        row["id"],
                         token_hash,
-                        _utc(params.verification_token_expiry),
+                        expires_at,
                     ),
                 )
-                return _user(row)
+                return row["email"], True
         except UniqueViolation as exc:
-            raise ConflictError("email or token already exists") from exc
+            raise ConflictError("registration token already exists") from exc
 
     def create_managed_user(self, params: CreateManagedUserParams) -> User:
         """Create an owner-provisioned, verified account with a setup token.
@@ -343,7 +462,8 @@ class Store:
             with self.pool.connection() as conn, conn.transaction():
                 conn.execute("SELECT pg_advisory_xact_lock(%s)", (OWNER_MANAGEMENT_LOCK,))
                 actor = conn.execute(
-                    "SELECT role, status FROM users WHERE id=%s FOR SHARE",
+                    """SELECT role, status FROM users WHERE id=%s
+                       AND archived_at IS NULL AND deleted_at IS NULL FOR SHARE""",
                     (params.actor_user_id,),
                 ).fetchone()
                 if actor is None or actor["role"] != Role.PLATFORM_OWNER.value or actor["status"] != "active":
@@ -389,18 +509,77 @@ class Store:
         except UniqueViolation as exc:
             raise ConflictError("email or token already exists") from exc
 
+    def resend_password_setup(self, params: ResendPasswordSetupParams) -> User:
+        """Replace an outstanding owner-provisioned password setup token."""
+
+        token_hash = _hash32(params.token_hash, "password reset token hash")
+        expires_at = _utc(params.expires_at)
+        try:
+            with self.pool.connection() as conn, conn.transaction():
+                conn.execute("SELECT pg_advisory_xact_lock(%s)", (OWNER_MANAGEMENT_LOCK,))
+                actor = conn.execute(
+                    """SELECT role, status FROM users WHERE id=%s
+                       AND archived_at IS NULL AND deleted_at IS NULL FOR SHARE""",
+                    (params.actor_user_id,),
+                ).fetchone()
+                if actor is None or actor["role"] != Role.PLATFORM_OWNER.value or actor["status"] != "active":
+                    raise UnauthorizedError("actor is not an active platform owner")
+                row = conn.execute(
+                    f"""SELECT {USER_SELECT} FROM users WHERE id=%s AND status='active'
+                        AND password_set_at IS NULL AND archived_at IS NULL
+                        AND deleted_at IS NULL FOR UPDATE""",
+                    (params.user_id,),
+                ).fetchone()
+                if row is None:
+                    exists = conn.execute(
+                        "SELECT EXISTS(SELECT 1 FROM users WHERE id=%s) AS exists",
+                        (params.user_id,),
+                    ).fetchone()["exists"]
+                    if not exists:
+                        raise NotFoundError("user not found")
+                    raise ConflictError("password setup is no longer pending")
+                conn.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (params.user_id,))
+                conn.execute(
+                    """INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
+                       VALUES (%s,%s,%s,%s)""",
+                    (params.token_id, params.user_id, token_hash, expires_at),
+                )
+                self._insert_audit(
+                    conn,
+                    replace(params.audit, target_id=str(params.user_id)),
+                )
+                return _user(row)
+        except UniqueViolation as exc:
+            raise ConflictError("password setup token already exists") from exc
+
     def user_credential_by_email(self, normalized_email: str) -> UserCredential:
         with self.pool.connection() as conn:
             row = conn.execute(
-                f"SELECT {USER_SELECT}, password_hash FROM users WHERE normalized_email = %s",
+                f"""SELECT {USER_SELECT}, password_hash FROM users WHERE normalized_email = %s
+                    AND archived_at IS NULL AND deleted_at IS NULL""",
                 (normalized_email,),
             ).fetchone()
         if row is None:
             raise NotFoundError("user not found")
         return UserCredential(_user(row), row["password_hash"])
 
-    def verify_email(self, token_hash: bytes, now: datetime) -> User:
+    def user_credential_by_id(self, user_id: UUID) -> UserCredential:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                f"""SELECT {USER_SELECT}, password_hash FROM users WHERE id=%s
+                    AND archived_at IS NULL AND deleted_at IS NULL""",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("user not found")
+        return UserCredential(_user(row), row["password_hash"])
+
+    def verify_email(self, token_hash: bytes, new_password_hash: str, now: datetime) -> User:
+        """Verify a pending registration and install its first password atomically."""
+
         token_hash = _hash32(token_hash, "verification token hash")
+        if not new_password_hash:
+            raise InvalidError("new password hash is required")
         now = _utc(now)
         with self.pool.connection() as conn, conn.transaction():
             row = conn.execute(
@@ -410,8 +589,16 @@ class Store:
             if row is None:
                 raise NotFoundError("verification token not found")
             user_id = row["user_id"]
-            if conn.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,)).fetchone() is None:
-                raise NotFoundError("user not found")
+            if (
+                conn.execute(
+                    """SELECT id FROM users WHERE id=%s AND role='customer' AND status='active'
+                   AND email_verified_at IS NULL AND password_set_at IS NULL
+                   AND archived_at IS NULL AND deleted_at IS NULL FOR UPDATE""",
+                    (user_id,),
+                ).fetchone()
+                is None
+            ):
+                raise NotFoundError("pending registration not found")
             token = conn.execute(
                 """UPDATE email_verification_tokens SET consumed_at = %s
                    WHERE token_hash = %s AND consumed_at IS NULL AND expires_at > %s
@@ -421,13 +608,19 @@ class Store:
             if token is None:
                 raise NotFoundError("verification token is invalid or expired")
             user_row = conn.execute(
-                f"""UPDATE users SET email_verified_at = COALESCE(email_verified_at, %s), updated_at = %s
-                    WHERE id = %s RETURNING {USER_SELECT}""",
-                (now, now, user_id),
+                f"""UPDATE users SET password_hash=%s, password_set_at=%s,
+                           email_verified_at=%s, revision=revision+1, updated_at=%s
+                    WHERE id=%s RETURNING {USER_SELECT}""",
+                (new_password_hash, now, now, now, user_id),
             ).fetchone()
             conn.execute(
                 """UPDATE email_verification_tokens SET consumed_at = COALESCE(consumed_at, %s)
                    WHERE user_id = %s""",
+                (now, user_id),
+            )
+            conn.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (user_id,))
+            conn.execute(
+                "UPDATE sessions SET revoked_at=COALESCE(revoked_at,%s) WHERE user_id=%s",
                 (now, user_id),
             )
             self._insert_audit(
@@ -445,14 +638,39 @@ class Store:
     def replace_email_verification_token(
         self, normalized_email: str, token_id: UUID, token_hash: bytes, expires_at: datetime
     ) -> tuple[str, bool]:
-        return self._replace_account_token(
-            "email_verification_tokens",
-            normalized_email,
-            token_id,
-            token_hash,
-            expires_at,
-            require_unverified=True,
-        )
+        token_hash = _hash32(token_hash, "email verification token hash")
+        expires_at = _utc(expires_at)
+        try:
+            with self.pool.connection() as conn, conn.transaction():
+                row = conn.execute(
+                    """SELECT id, email FROM users
+                       WHERE normalized_email=%s AND role='customer' AND status='active'
+                         AND email_verified_at IS NULL AND password_set_at IS NULL
+                         AND archived_at IS NULL AND deleted_at IS NULL FOR UPDATE""",
+                    (normalized_email,),
+                ).fetchone()
+                if row is None:
+                    return "", False
+                conn.execute(
+                    """UPDATE users SET password_hash=%s, password_set_at=NULL,
+                              revision=revision+1, updated_at=clock_timestamp()
+                       WHERE id=%s""",
+                    (PENDING_REGISTRATION_PASSWORD_HASH, row["id"]),
+                )
+                conn.execute(
+                    "UPDATE sessions SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE user_id=%s",
+                    (row["id"],),
+                )
+                conn.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (row["id"],))
+                conn.execute("DELETE FROM email_verification_tokens WHERE user_id=%s", (row["id"],))
+                conn.execute(
+                    """INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at)
+                       VALUES (%s,%s,%s,%s)""",
+                    (token_id, row["id"], token_hash, expires_at),
+                )
+                return row["email"], True
+        except UniqueViolation as exc:
+            raise ConflictError("verification token already exists") from exc
 
     def replace_password_reset_token(
         self, normalized_email: str, token_id: UUID, token_hash: bytes, expires_at: datetime
@@ -480,15 +698,19 @@ class Store:
         if table not in {"email_verification_tokens", "password_reset_tokens"}:
             raise AssertionError("invalid token table")
         token_hash = _hash32(token_hash, "account token hash")
-        predicate = "AND email_verified_at IS NULL" if require_unverified else ""
+        predicate = (
+            "AND email_verified_at IS NULL" if require_unverified else "AND email_verified_at IS NOT NULL"
+        )
         with self.pool.connection() as conn, conn.transaction():
             row = conn.execute(
                 f"""SELECT id, email FROM users
-                    WHERE normalized_email = %s AND status = 'active' {predicate} FOR UPDATE""",
+                    WHERE normalized_email = %s AND status = 'active'
+                      AND archived_at IS NULL AND deleted_at IS NULL {predicate} FOR UPDATE""",
                 (normalized_email,),
             ).fetchone()
             if row is None:
                 return "", False
+            conn.execute(f"DELETE FROM {table} WHERE user_id=%s", (row["id"],))
             conn.execute(
                 f"INSERT INTO {table} (id, user_id, token_hash, expires_at) VALUES (%s, %s, %s, %s)",
                 (token_id, row["id"], token_hash, _utc(expires_at)),
@@ -507,7 +729,10 @@ class Store:
             user_id = row["user_id"]
             if (
                 conn.execute(
-                    "SELECT id FROM users WHERE id = %s AND status = 'active' FOR UPDATE", (user_id,)
+                    """SELECT id FROM users WHERE id=%s AND status='active'
+                       AND email_verified_at IS NOT NULL
+                       AND archived_at IS NULL AND deleted_at IS NULL FOR UPDATE""",
+                    (user_id,),
                 ).fetchone()
                 is None
             ):
@@ -520,8 +745,9 @@ class Store:
             if consumed is None:
                 raise NotFoundError("password reset token is invalid or expired")
             conn.execute(
-                "UPDATE users SET password_hash = %s, updated_at = %s WHERE id = %s",
-                (new_password_hash, now, user_id),
+                """UPDATE users SET password_hash = %s, password_set_at = %s,
+                          revision = revision + 1, updated_at = %s WHERE id = %s""",
+                (new_password_hash, now, now, user_id),
             )
             conn.execute(
                 """UPDATE password_reset_tokens SET consumed_at = COALESCE(consumed_at, %s)
@@ -553,7 +779,9 @@ class Store:
         with self.pool.connection() as conn, conn.transaction():
             user = conn.execute(
                 """SELECT id FROM users WHERE id=%s AND status='active'
-                   AND email_verified_at IS NOT NULL FOR SHARE""",
+                   AND email_verified_at IS NOT NULL AND password_set_at IS NOT NULL
+                   AND archived_at IS NULL
+                   AND deleted_at IS NULL FOR SHARE""",
                 (params.user_id,),
             ).fetchone()
             if user is None:
@@ -588,7 +816,9 @@ class Store:
                            s.id AS session_id
                     FROM sessions s JOIN users u ON u.id = s.user_id
                     WHERE s.access_token_hash = %s AND s.revoked_at IS NULL
-                      AND s.access_expires_at > %s AND u.status = 'active'""",
+                       AND s.access_expires_at > %s AND u.status = 'active'
+                       AND u.email_verified_at IS NOT NULL AND u.password_set_at IS NOT NULL
+                       AND u.archived_at IS NULL AND u.deleted_at IS NULL""",
                 (access_hash, _utc(now)),
             ).fetchone()
         if row is None:
@@ -605,7 +835,11 @@ class Store:
         with self.pool.connection() as conn, conn.transaction():
             family = conn.execute(
                 """SELECT s.family_id FROM refresh_tokens rt
-                   JOIN sessions s ON s.id=rt.session_id WHERE rt.token_hash=%s""",
+                   JOIN sessions s ON s.id=rt.session_id
+                   JOIN users u ON u.id=s.user_id
+                    WHERE rt.token_hash=%s AND u.status='active'
+                      AND u.email_verified_at IS NOT NULL AND u.password_set_at IS NOT NULL
+                      AND u.archived_at IS NULL AND u.deleted_at IS NULL""",
                 (old_hash,),
             ).fetchone()
             if family is None:
@@ -676,6 +910,119 @@ class Store:
                 (_utc(now), user_id),
             )
 
+    def list_account_sessions(self, user_id: UUID, now: datetime) -> list[AccountSession]:
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT {SESSION_SELECT} FROM sessions
+                    WHERE user_id=%s AND revoked_at IS NULL AND refresh_expires_at>%s
+                    ORDER BY last_seen_at DESC, created_at DESC, id DESC""",
+                (user_id, _utc(now)),
+            ).fetchall()
+        return [
+            AccountSession(**{name: row[name] for name in AccountSession.__dataclass_fields__})
+            for row in rows
+        ]
+
+    def revoke_user_session(
+        self,
+        user_id: UUID,
+        session_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+    ) -> None:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            row = conn.execute(
+                """UPDATE sessions SET revoked_at=COALESCE(revoked_at,%s)
+                   WHERE id=%s AND user_id=%s RETURNING id""",
+                (now, session_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("session not found")
+            self._insert_audit(
+                conn,
+                replace(audit, actor_user_id=user_id, target_id=str(session_id)),
+            )
+
+    def revoke_other_user_sessions(
+        self,
+        user_id: UUID,
+        current_session_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+    ) -> int:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            current = conn.execute(
+                """SELECT id FROM sessions WHERE id=%s AND user_id=%s
+                   AND revoked_at IS NULL FOR SHARE""",
+                (current_session_id, user_id),
+            ).fetchone()
+            if current is None:
+                raise UnauthorizedError("current session is not active")
+            cursor = conn.execute(
+                """UPDATE sessions SET revoked_at=COALESCE(revoked_at,%s)
+                   WHERE user_id=%s AND id<>%s AND revoked_at IS NULL""",
+                (now, user_id, current_session_id),
+            )
+            count = max(cursor.rowcount, 0)
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    actor_user_id=user_id,
+                    target_id=str(user_id),
+                    details={**audit.details, "revokedSessions": count},
+                ),
+            )
+            return count
+
+    def change_password(
+        self,
+        user_id: UUID,
+        current_session_id: UUID,
+        expected_password_hash: str,
+        new_password_hash: str,
+        now: datetime,
+        audit: AuditEvent,
+    ) -> None:
+        if not expected_password_hash or not new_password_hash:
+            raise InvalidError("password hashes are required")
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            row = conn.execute(
+                """SELECT password_hash FROM users WHERE id=%s AND status='active'
+                   AND email_verified_at IS NOT NULL AND password_set_at IS NOT NULL
+                   AND archived_at IS NULL AND deleted_at IS NULL FOR UPDATE""",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                raise UnauthorizedError("user cannot change a password")
+            if not hmac.compare_digest(row["password_hash"], expected_password_hash):
+                raise ConflictError("password changed during this request")
+            current = conn.execute(
+                """SELECT id FROM sessions WHERE id=%s AND user_id=%s
+                   AND revoked_at IS NULL FOR SHARE""",
+                (current_session_id, user_id),
+            ).fetchone()
+            if current is None:
+                raise UnauthorizedError("current session is not active")
+            conn.execute(
+                """UPDATE users SET password_hash=%s, password_set_at=%s,
+                          revision=revision+1, updated_at=%s WHERE id=%s""",
+                (new_password_hash, now, now, user_id),
+            )
+            conn.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (user_id,))
+            conn.execute(
+                """UPDATE sessions SET revoked_at=COALESCE(revoked_at,%s)
+                   WHERE user_id=%s AND id<>%s""",
+                (now, user_id, current_session_id),
+            )
+            self._insert_audit(
+                conn,
+                replace(audit, actor_user_id=user_id, target_id=str(user_id)),
+            )
+
     def bootstrap_owner(
         self, user_id: UUID, email: str, normalized_email: str, password_hash: str, now: datetime
     ) -> User:
@@ -688,9 +1035,10 @@ class Store:
                     raise ConflictError("a platform owner already exists")
                 row = conn.execute(
                     f"""INSERT INTO users
-                        (id, email, normalized_email, password_hash, role, email_verified_at)
-                        VALUES (%s,%s,%s,%s,'platform_owner',%s) RETURNING {USER_SELECT}""",
-                    (user_id, email, normalized_email, password_hash, _utc(now)),
+                        (id, email, normalized_email, password_hash, role,
+                         email_verified_at, password_set_at)
+                        VALUES (%s,%s,%s,%s,'platform_owner',%s,%s) RETURNING {USER_SELECT}""",
+                    (user_id, email, normalized_email, password_hash, _utc(now), _utc(now)),
                 ).fetchone()
                 self._insert_audit(
                     conn,
@@ -709,6 +1057,7 @@ class Store:
     def create_product(self, params: CreateProductParams) -> Product:
         try:
             with self.pool.connection() as conn, conn.transaction():
+                self._require_license_writer(conn, params.created_by)
                 row = conn.execute(
                     f"""INSERT INTO products (id, code, name, description, created_by)
                         VALUES (%s,%s,%s,%s,%s) RETURNING {PRODUCT_SELECT}""",
@@ -732,12 +1081,59 @@ class Store:
             raise NotFoundError("product not found")
         return _product(row)
 
+    def update_product_status(
+        self,
+        code: str,
+        status: str,
+        actor_user_id: UUID,
+        expected_revision: int,
+        audit: AuditEvent,
+    ) -> Product:
+        if status not in {"active", "retired"}:
+            raise InvalidError("invalid product status")
+        with self.pool.connection() as conn, conn.transaction():
+            self._require_license_writer(conn, actor_user_id)
+            row = conn.execute(
+                f"SELECT {PRODUCT_SELECT} FROM products WHERE code=%s FOR UPDATE",
+                (code,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("product not found")
+            current = _product(row)
+            self._check_revision(current.revision, expected_revision)
+            if current.status == status:
+                return current
+            updated_row = conn.execute(
+                f"""UPDATE products SET status=%s, revision=revision+1,
+                           updated_at=clock_timestamp() WHERE id=%s
+                    RETURNING {PRODUCT_SELECT}""",
+                (status, current.id),
+            ).fetchone()
+            updated = _product(updated_row)
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    actor_user_id=actor_user_id,
+                    target_id=str(current.id),
+                    details={
+                        **audit.details,
+                        "code": current.code,
+                        "previousStatus": current.status,
+                        "status": updated.status,
+                        "revision": updated.revision,
+                    },
+                ),
+            )
+            return updated
+
     def register_issuer(self, params: RegisterIssuerParams) -> IssuerKey:
         fingerprint = _hash32(params.fingerprint, "issuer fingerprint")
         if len(params.public_key) != 32:
             raise InvalidError("issuer public key must contain exactly 32 bytes")
         try:
             with self.pool.connection() as conn, conn.transaction():
+                self._require_owner(conn, params.created_by)
                 row = conn.execute(
                     """INSERT INTO issuer_keys
                        (key_id, issuer, public_key, fingerprint_sha256, not_before, not_after, created_by)
@@ -786,6 +1182,7 @@ class Store:
         if status not in {"active", "retired", "revoked"}:
             raise InvalidError("invalid issuer status")
         with self.pool.connection() as conn, conn.transaction():
+            self._require_owner(conn, actor)
             row = conn.execute(
                 "SELECT status FROM issuer_keys WHERE key_id = %s FOR UPDATE", (key_id,)
             ).fetchone()
@@ -813,12 +1210,15 @@ class Store:
         try:
             with self.pool.connection() as conn, conn.transaction():
                 conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (str(params.serial),))
+                self._require_license_writer(conn, params.created_by)
                 existing = conn.execute(
-                    """SELECT id, source, import_artifact_hash, creation_request_hash
+                    """SELECT id, source, import_artifact_hash, creation_request_hash, deleted_at
                        FROM licenses WHERE serial = %s FOR UPDATE""",
                     (params.serial,),
                 ).fetchone()
                 if existing is not None:
+                    if existing["deleted_at"] is not None:
+                        raise ConflictError("a deleted license serial cannot be reissued")
                     same_offline = (
                         params.source == "offline_import"
                         and existing["source"] == params.source
@@ -838,6 +1238,12 @@ class Store:
                     if same_offline or same_online:
                         return self._license_by_id_conn(conn, existing["id"]), True
                     raise ConflictError("serial is already associated with different license data")
+                product = conn.execute(
+                    "SELECT status FROM products WHERE id=%s FOR SHARE",
+                    (params.product_id,),
+                ).fetchone()
+                if product is None or product["status"] != "active":
+                    raise ConflictError("new licenses require an active product")
                 if params.source == "offline_import":
                     if params.issuer_key_id is None:
                         raise InvalidError("offline import requires an issuer key")
@@ -892,9 +1298,18 @@ class Store:
         code_hash = _hash32(code_hash, "claim code hash")
         now = _utc(now)
         with self.pool.connection() as conn, conn.transaction():
+            eligible_user = conn.execute(
+                """SELECT id FROM users WHERE id=%s AND role='customer' AND status='active'
+                   AND email_verified_at IS NOT NULL AND archived_at IS NULL
+                   AND deleted_at IS NULL FOR SHARE""",
+                (user_id,),
+            ).fetchone()
+            if eligible_user is None:
+                raise InvalidError("claim code is invalid")
             row = conn.execute(
                 """SELECT id, owner_user_id, state, not_before, expires_at
-                   FROM licenses WHERE claim_code_hash = %s FOR UPDATE""",
+                   FROM licenses WHERE claim_code_hash = %s
+                     AND archived_at IS NULL AND deleted_at IS NULL FOR UPDATE""",
                 (code_hash,),
             ).fetchone()
             # The invalid result deliberately does not distinguish unknown,
@@ -922,14 +1337,20 @@ class Store:
     def list_user_licenses(self, user_id: UUID) -> list[License]:
         with self.pool.connection() as conn:
             rows = conn.execute(
-                LICENSE_SELECT + " WHERE l.owner_user_id = %s ORDER BY l.created_at DESC", (user_id,)
+                LICENSE_SELECT
+                + """ WHERE l.owner_user_id = %s AND l.archived_at IS NULL
+                      AND l.deleted_at IS NULL ORDER BY l.created_at DESC""",
+                (user_id,),
             ).fetchall()
         return [_license(row) for row in rows]
 
     def license_for_owner(self, license_id: UUID, user_id: UUID) -> License:
         with self.pool.connection() as conn:
             row = conn.execute(
-                LICENSE_SELECT + " WHERE l.id = %s AND l.owner_user_id = %s", (license_id, user_id)
+                LICENSE_SELECT
+                + """ WHERE l.id = %s AND l.owner_user_id = %s
+                      AND l.archived_at IS NULL AND l.deleted_at IS NULL""",
+                (license_id, user_id),
             ).fetchone()
         if row is None:
             raise NotFoundError("license not found")
@@ -1005,7 +1426,8 @@ class Store:
             row = conn.execute(
                 """UPDATE activations a SET state = 'deactivated', deactivated_at = %s, updated_at = %s
                    FROM licenses l WHERE a.id = %s AND l.id = a.license_id
-                   AND l.owner_user_id = %s AND a.state = 'active' RETURNING a.id""",
+                   AND l.owner_user_id = %s AND l.archived_at IS NULL
+                   AND l.deleted_at IS NULL AND a.state = 'active' RETURNING a.id""",
                 (_utc(now), _utc(now), activation_id, owner_user_id),
             ).fetchone()
             if row is None:
@@ -1019,18 +1441,30 @@ class Store:
                 return
             self._insert_audit(conn, replace(audit, target_id=str(activation_id)))
 
-    def set_license_state(self, license_id: UUID, state: str, now: datetime, audit: AuditEvent) -> None:
+    def set_license_state(
+        self,
+        license_id: UUID,
+        state: str,
+        actor_user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+    ) -> None:
         if state not in {"active", "suspended", "revoked"}:
             raise InvalidError("invalid license state")
         now = _utc(now)
         with self.pool.connection() as conn, conn.transaction():
+            self._require_license_writer(conn, actor_user_id)
             row = conn.execute(
-                "SELECT state FROM licenses WHERE id = %s FOR UPDATE", (license_id,)
+                """SELECT state, archived_at FROM licenses WHERE id = %s
+                   AND deleted_at IS NULL FOR UPDATE""",
+                (license_id,),
             ).fetchone()
             if row is None:
                 raise NotFoundError("license not found")
             if row["state"] == "revoked" and state != "revoked":
                 raise ConflictError("a revoked license cannot be reactivated")
+            if row["archived_at"] is not None and state == "active":
+                raise ConflictError("an archived license cannot be activated")
             if row["state"] == state:
                 return
             conn.execute(
@@ -1075,6 +1509,7 @@ class Store:
                    SELECT %s, a.id, %s, %s FROM activations a
                    JOIN licenses l ON l.id=a.license_id
                    WHERE a.id=%s AND a.state='active' AND l.state='active'
+                     AND l.archived_at IS NULL AND l.deleted_at IS NULL
                      AND l.not_before<=%s AND (l.expires_at IS NULL OR l.expires_at>%s)
                    RETURNING id""",
                 (challenge_id, nonce_hash, expires_at, activation_id, now, now),
@@ -1176,19 +1611,26 @@ class Store:
             self._insert_audit(conn, replace(audit, target_id=str(ids["activation_id"])))
             return license, _activation(updated)
 
-    def user_by_id(self, user_id: UUID) -> User:
+    def user_by_id(self, user_id: UUID, *, include_deleted: bool = False) -> User:
+        lifecycle = "" if include_deleted else " AND deleted_at IS NULL"
         with self.pool.connection() as conn:
-            row = conn.execute(f"SELECT {USER_SELECT} FROM users WHERE id=%s", (user_id,)).fetchone()
+            row = conn.execute(
+                f"SELECT {USER_SELECT} FROM users WHERE id=%s{lifecycle}", (user_id,)
+            ).fetchone()
         if row is None:
             raise NotFoundError("user not found")
         return _user(row)
 
-    def list_users(self, normalized_email: str = "", limit: int = 100) -> list[User]:
+    def list_users(
+        self, normalized_email: str = "", limit: int = 100, lifecycle: str = "current"
+    ) -> list[User]:
         self._validate_limit(limit)
+        lifecycle_predicate = _lifecycle_predicate("users", lifecycle)
         with self.pool.connection() as conn:
             rows = conn.execute(
                 f"""SELECT {USER_SELECT} FROM users
                     WHERE (%s='' OR normalized_email=%s)
+                      AND {lifecycle_predicate}
                     ORDER BY created_at DESC, id DESC LIMIT %s""",
                 (normalized_email, normalized_email, limit),
             ).fetchall()
@@ -1211,7 +1653,8 @@ class Store:
                 row = actor
             else:
                 actor = conn.execute(
-                    "SELECT role, status FROM users WHERE id=%s FOR SHARE",
+                    """SELECT role, status FROM users WHERE id=%s
+                       AND archived_at IS NULL AND deleted_at IS NULL FOR SHARE""",
                     (params.actor_user_id,),
                 ).fetchone()
                 row = conn.execute(
@@ -1222,8 +1665,13 @@ class Store:
             if row is None:
                 raise NotFoundError("user not found")
             current = _user(row)
+            if current.archived_at is not None or current.deleted_at is not None:
+                raise ConflictError("an archived or deleted user's access cannot be changed")
+            self._check_revision(current.revision, params.expected_revision)
             role = params.role or current.role
             status = params.status or current.status
+            if role.is_privileged and current.email_verified_at is None:
+                raise ConflictError("email verification must be completed before assigning a privileged role")
             if params.actor_user_id == params.user_id and (
                 role is not Role.PLATFORM_OWNER or status != "active"
             ):
@@ -1236,13 +1684,16 @@ class Store:
                 and not (role is Role.PLATFORM_OWNER and status == "active")
             ):
                 owners = conn.execute(
-                    "SELECT count(*) AS count FROM users WHERE role='platform_owner' AND status='active'"
+                    """SELECT count(*) AS count FROM users
+                       WHERE role='platform_owner' AND status='active'
+                         AND archived_at IS NULL AND deleted_at IS NULL"""
                 ).fetchone()["count"]
                 if owners <= 1:
                     raise ConflictError("cannot remove or disable the last active platform owner")
             now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
             updated_row = conn.execute(
-                f"""UPDATE users SET role=%s, status=%s, updated_at=%s WHERE id=%s
+                f"""UPDATE users SET role=%s, status=%s, revision=revision+1,
+                          updated_at=%s WHERE id=%s
                     RETURNING {USER_SELECT}""",
                 (role.value, status, now, params.user_id),
             ).fetchone()
@@ -1270,18 +1721,645 @@ class Store:
             )
             return updated
 
+    def archive_user(
+        self,
+        user_id: UUID,
+        actor_user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+        expected_revision: int | None = None,
+    ) -> User:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (OWNER_MANAGEMENT_LOCK,))
+            self._require_owner(conn, actor_user_id)
+            if user_id == actor_user_id:
+                raise ConflictError("a platform owner cannot archive their own account")
+            row = conn.execute(
+                f"SELECT {USER_SELECT} FROM users WHERE id=%s FOR UPDATE", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("user not found")
+            current = _user(row)
+            if current.deleted_at is not None:
+                raise ConflictError("a deleted user cannot be archived")
+            if current.archived_at is not None:
+                return current
+            self._check_revision(current.revision, expected_revision)
+            if current.role is Role.PLATFORM_OWNER and current.status == "active":
+                owners = conn.execute(
+                    """SELECT count(*) AS count FROM users
+                       WHERE role='platform_owner' AND status='active'
+                         AND archived_at IS NULL AND deleted_at IS NULL"""
+                ).fetchone()["count"]
+                if owners <= 1:
+                    raise ConflictError("cannot archive the last active platform owner")
+            updated_row = conn.execute(
+                f"""UPDATE users SET status='disabled', archived_at=%s, archived_by=%s,
+                          revision=revision+1, updated_at=%s WHERE id=%s
+                    RETURNING {USER_SELECT}""",
+                (now, actor_user_id, now, user_id),
+            ).fetchone()
+            conn.execute(
+                "UPDATE sessions SET revoked_at=COALESCE(revoked_at,%s) WHERE user_id=%s",
+                (now, user_id),
+            )
+            conn.execute("DELETE FROM email_verification_tokens WHERE user_id=%s", (user_id,))
+            conn.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (user_id,))
+            conn.execute(
+                """UPDATE license_requests SET status='cancelled', updated_at=%s
+                   WHERE requester_user_id=%s AND status IN ('pending','approved')""",
+                (now, user_id),
+            )
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    target_id=str(user_id),
+                    details={
+                        **audit.details,
+                        "previousStatus": current.status,
+                        "status": "disabled",
+                        "revision": current.revision + 1,
+                    },
+                ),
+            )
+            return _user(updated_row)
+
+    def restore_user(
+        self,
+        user_id: UUID,
+        actor_user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+        expected_revision: int | None = None,
+    ) -> User:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (OWNER_MANAGEMENT_LOCK,))
+            self._require_owner(conn, actor_user_id)
+            row = conn.execute(
+                f"SELECT {USER_SELECT} FROM users WHERE id=%s FOR UPDATE", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("user not found")
+            current = _user(row)
+            if current.deleted_at is not None:
+                raise ConflictError("a deleted user cannot be restored")
+            if current.archived_at is None:
+                return current
+            self._check_revision(current.revision, expected_revision)
+            updated_row = conn.execute(
+                f"""UPDATE users SET archived_at=NULL, archived_by=NULL,
+                          status='disabled', revision=revision+1, updated_at=%s
+                    WHERE id=%s RETURNING {USER_SELECT}""",
+                (now, user_id),
+            ).fetchone()
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    target_id=str(user_id),
+                    details={**audit.details, "status": "disabled", "revision": current.revision + 1},
+                ),
+            )
+            return _user(updated_row)
+
+    def delete_user(
+        self,
+        user_id: UUID,
+        actor_user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+        expected_revision: int | None = None,
+    ) -> User:
+        """Irreversibly anonymize an archived user while retaining FK history."""
+
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (OWNER_MANAGEMENT_LOCK,))
+            self._require_owner(conn, actor_user_id)
+            if user_id == actor_user_id:
+                raise ConflictError("a platform owner cannot delete their own account")
+            row = conn.execute(
+                f"SELECT {USER_SELECT} FROM users WHERE id=%s FOR UPDATE", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("user not found")
+            current = _user(row)
+            if current.deleted_at is not None:
+                return current
+            if current.archived_at is None or current.status != "disabled":
+                raise ConflictError("user must be disabled and archived before deletion")
+            self._check_revision(current.revision, expected_revision)
+            blocking = conn.execute(
+                """SELECT EXISTS(SELECT 1 FROM licenses WHERE owner_user_id=%s
+                          AND state<>'revoked' AND deleted_at IS NULL) AS exists""",
+                (user_id,),
+            ).fetchone()["exists"]
+            if blocking:
+                raise ConflictError("user owns licenses that have not been revoked")
+            tombstone_email = f"deleted-{user_id}@users.invalid"
+            updated_row = conn.execute(
+                f"""UPDATE users SET email=%s, normalized_email=%s,
+                          password_hash='!deleted', password_set_at=NULL,
+                          role='customer', status='disabled', email_verified_at=NULL,
+                          deleted_at=%s, deleted_by=%s, revision=revision+1, updated_at=%s
+                    WHERE id=%s RETURNING {USER_SELECT}""",
+                (tombstone_email, tombstone_email, now, actor_user_id, now, user_id),
+            ).fetchone()
+            conn.execute(
+                "UPDATE sessions SET revoked_at=COALESCE(revoked_at,%s) WHERE user_id=%s",
+                (now, user_id),
+            )
+            conn.execute("DELETE FROM email_verification_tokens WHERE user_id=%s", (user_id,))
+            conn.execute("DELETE FROM password_reset_tokens WHERE user_id=%s", (user_id,))
+            conn.execute(
+                """UPDATE license_requests SET status='cancelled', updated_at=%s
+                   WHERE requester_user_id=%s AND status IN ('pending','approved')""",
+                (now, user_id),
+            )
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    target_id=str(user_id),
+                    details={**audit.details, "anonymized": True, "revision": current.revision + 1},
+                ),
+            )
+            return _user(updated_row)
+
+    def archive_license(
+        self,
+        license_id: UUID,
+        actor_user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+        expected_revision: int | None = None,
+    ) -> License:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            self._require_license_writer(conn, actor_user_id)
+            row = conn.execute(LICENSE_SELECT + " WHERE l.id=%s FOR UPDATE OF l", (license_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("license not found")
+            current = _license(row)
+            if current.deleted_at is not None:
+                raise ConflictError("a deleted license cannot be archived")
+            if current.archived_at is not None:
+                return current
+            self._check_revision(current.revision, expected_revision)
+            state = "suspended" if current.state == "active" else current.state
+            conn.execute(
+                """DELETE FROM activation_challenges c USING activations a
+                   WHERE c.activation_id=a.id AND a.license_id=%s""",
+                (license_id,),
+            )
+            conn.execute(
+                """UPDATE activations SET state='deactivated', deactivated_at=%s, updated_at=%s
+                   WHERE license_id=%s AND state='active'""",
+                (now, now, license_id),
+            )
+            conn.execute(
+                """UPDATE licenses SET state=%s, archived_at=%s, archived_by=%s,
+                          revision=revision+1, updated_at=%s WHERE id=%s""",
+                (state, now, actor_user_id, now, license_id),
+            )
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    target_id=str(license_id),
+                    details={
+                        **audit.details,
+                        "previousState": current.state,
+                        "state": state,
+                        "revision": current.revision + 1,
+                    },
+                ),
+            )
+            return self._license_by_id_conn(conn, license_id)
+
+    def restore_license(
+        self,
+        license_id: UUID,
+        actor_user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+        expected_revision: int | None = None,
+    ) -> License:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            self._require_license_writer(conn, actor_user_id)
+            row = conn.execute(LICENSE_SELECT + " WHERE l.id=%s FOR UPDATE OF l", (license_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("license not found")
+            current = _license(row)
+            if current.deleted_at is not None:
+                raise ConflictError("a deleted license cannot be restored")
+            if current.archived_at is None:
+                return current
+            self._check_revision(current.revision, expected_revision)
+            conn.execute(
+                """UPDATE licenses SET archived_at=NULL, archived_by=NULL,
+                          revision=revision+1, updated_at=%s WHERE id=%s""",
+                (now, license_id),
+            )
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    target_id=str(license_id),
+                    details={
+                        **audit.details,
+                        "state": current.state,
+                        "revision": current.revision + 1,
+                    },
+                ),
+            )
+            return self._license_by_id_conn(conn, license_id)
+
+    def delete_license(
+        self,
+        license_id: UUID,
+        actor_user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+        expected_revision: int | None = None,
+    ) -> License:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            self._require_owner(conn, actor_user_id)
+            row = conn.execute(LICENSE_SELECT + " WHERE l.id=%s FOR UPDATE OF l", (license_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("license not found")
+            current = _license(row)
+            if current.deleted_at is not None:
+                return current
+            if current.archived_at is None or current.state != "revoked":
+                raise ConflictError("license must be revoked and archived before deletion")
+            self._check_revision(current.revision, expected_revision)
+            conn.execute(
+                """DELETE FROM activation_challenges c USING activations a
+                   WHERE c.activation_id=a.id AND a.license_id=%s""",
+                (license_id,),
+            )
+            conn.execute(
+                """UPDATE licenses SET deleted_at=%s, deleted_by=%s,
+                          revision=revision+1, updated_at=%s WHERE id=%s""",
+                (now, actor_user_id, now, license_id),
+            )
+            self._insert_audit(
+                conn,
+                replace(
+                    audit,
+                    target_id=str(license_id),
+                    details={**audit.details, "revision": current.revision + 1},
+                ),
+            )
+            return self._license_by_id_conn(conn, license_id)
+
+    def create_license_request(self, params: CreateLicenseRequestParams) -> LicenseRequest:
+        if not 1 <= params.requested_activations <= 100_000:
+            raise InvalidError("requested activations must be between 1 and 100000")
+        message = _clean_request_text(params.message, "license request message")
+        try:
+            with self.pool.connection() as conn, conn.transaction():
+                requester = conn.execute(
+                    """SELECT role, status, email_verified_at FROM users WHERE id=%s
+                       AND archived_at IS NULL AND deleted_at IS NULL FOR UPDATE""",
+                    (params.requester_user_id,),
+                ).fetchone()
+                if (
+                    requester is None
+                    or requester["role"] != Role.CUSTOMER.value
+                    or requester["status"] != "active"
+                    or requester["email_verified_at"] is None
+                ):
+                    raise UnauthorizedError("customer cannot request a license")
+                product = conn.execute(
+                    "SELECT id FROM products WHERE id=%s AND status='active' FOR SHARE",
+                    (params.product_id,),
+                ).fetchone()
+                if product is None:
+                    raise NotFoundError("active product not found")
+                recent_count = conn.execute(
+                    """SELECT count(*) AS count FROM license_requests
+                       WHERE requester_user_id=%s
+                         AND created_at>=clock_timestamp()-interval '24 hours'""",
+                    (params.requester_user_id,),
+                ).fetchone()["count"]
+                if recent_count >= 10:
+                    raise ConflictError("daily license request limit reached")
+                conn.execute(
+                    """INSERT INTO license_requests
+                       (id, requester_user_id, product_id, requested_activations, message)
+                       VALUES (%s,%s,%s,%s,%s)""",
+                    (
+                        params.id,
+                        params.requester_user_id,
+                        params.product_id,
+                        params.requested_activations,
+                        message,
+                    ),
+                )
+                self._insert_audit(conn, replace(params.audit, target_id=str(params.id)))
+                return self._license_request_by_id_conn(conn, params.id)
+        except UniqueViolation as exc:
+            raise ConflictError("an open license request already exists for this product") from exc
+
+    def list_user_license_requests(
+        self, user_id: UUID, status: str = "", limit: int = 100
+    ) -> list[LicenseRequest]:
+        self._validate_limit(limit)
+        if status and status not in VALID_LICENSE_REQUEST_STATUSES:
+            raise InvalidError("invalid license request status")
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                LICENSE_REQUEST_SELECT
+                + """ WHERE r.requester_user_id=%s AND (%s='' OR r.status=%s)
+                      ORDER BY r.created_at DESC, r.id DESC LIMIT %s""",
+                (user_id, status, status, limit),
+            ).fetchall()
+        return [_license_request(row) for row in rows]
+
+    def license_request_for_user(self, request_id: UUID, user_id: UUID) -> LicenseRequest:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                LICENSE_REQUEST_SELECT + " WHERE r.id=%s AND r.requester_user_id=%s",
+                (request_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("license request not found")
+        return _license_request(row)
+
+    def cancel_license_request(
+        self,
+        request_id: UUID,
+        user_id: UUID,
+        now: datetime,
+        audit: AuditEvent,
+    ) -> LicenseRequest:
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            row = conn.execute(
+                """SELECT status FROM license_requests
+                   WHERE id=%s AND requester_user_id=%s FOR UPDATE""",
+                (request_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("license request not found")
+            if row["status"] == "cancelled":
+                return self._license_request_by_id_conn(conn, request_id)
+            if row["status"] != "pending":
+                raise ConflictError("only a pending license request can be cancelled")
+            conn.execute(
+                """UPDATE license_requests SET status='cancelled', updated_at=%s WHERE id=%s""",
+                (now, request_id),
+            )
+            self._insert_audit(conn, replace(audit, target_id=str(request_id)))
+            return self._license_request_by_id_conn(conn, request_id)
+
+    def list_license_requests(self, filters: LicenseRequestListFilter | None = None) -> list[LicenseRequest]:
+        filters = filters or LicenseRequestListFilter()
+        self._validate_limit(filters.limit)
+        if filters.status and filters.status not in VALID_LICENSE_REQUEST_STATUSES:
+            raise InvalidError("invalid license request status")
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                LICENSE_REQUEST_SELECT
+                + """ WHERE (%s='' OR r.status=%s)
+                      AND (%s='' OR u.normalized_email=%s)
+                      AND (%s='' OR p.code=%s)
+                      ORDER BY r.created_at DESC, r.id DESC LIMIT %s""",
+                (
+                    filters.status,
+                    filters.status,
+                    filters.requester_normalized_email,
+                    filters.requester_normalized_email,
+                    filters.product_code,
+                    filters.product_code,
+                    filters.limit,
+                ),
+            ).fetchall()
+        return [_license_request(row) for row in rows]
+
+    def license_request_by_id(self, request_id: UUID) -> LicenseRequest:
+        with self.pool.connection() as conn:
+            return self._license_request_by_id_conn(conn, request_id)
+
+    def deny_license_request(
+        self,
+        request_id: UUID,
+        actor_user_id: UUID,
+        admin_notes: str,
+        now: datetime,
+        audit: AuditEvent,
+    ) -> LicenseRequest:
+        admin_notes = _clean_request_text(admin_notes, "license request admin notes")
+        now = _utc(now)
+        with self.pool.connection() as conn, conn.transaction():
+            self._require_license_writer(conn, actor_user_id)
+            row = conn.execute(
+                "SELECT status, admin_notes FROM license_requests WHERE id=%s FOR UPDATE",
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("license request not found")
+            if row["status"] == "denied" and row["admin_notes"] == admin_notes:
+                return self._license_request_by_id_conn(conn, request_id)
+            if row["status"] not in {"pending", "approved"}:
+                raise ConflictError("license request is no longer reviewable")
+            conn.execute(
+                """UPDATE license_requests SET status='denied', admin_notes=%s,
+                          reviewed_by=%s, reviewed_at=%s, updated_at=%s WHERE id=%s""",
+                (admin_notes, actor_user_id, now, now, request_id),
+            )
+            self._insert_audit(conn, replace(audit, target_id=str(request_id)))
+            return self._license_request_by_id_conn(conn, request_id)
+
+    def approve_license_request(
+        self,
+        request_id: UUID,
+        params: CreateLicenseParams,
+        admin_notes: str,
+        now: datetime,
+        audit: AuditEvent,
+    ) -> tuple[LicenseRequest, License, bool]:
+        """Atomically fulfill a request with an online license assigned to its customer."""
+
+        _hash32(params.claim_code_hash, "claim code hash")
+        if params.creation_request_hash is None:
+            raise InvalidError("online approval requires a creation request hash")
+        _hash32(params.creation_request_hash, "creation request hash")
+        if params.source != "online" or any(
+            value is not None
+            for value in (params.issuer_key_id, params.import_artifact, params.import_artifact_hash)
+        ):
+            raise InvalidError("license request approval requires online license data")
+        admin_notes = _clean_request_text(admin_notes, "license request admin notes")
+        now = _utc(now)
+        try:
+            with self.pool.connection() as conn, conn.transaction():
+                self._require_license_writer(conn, params.created_by)
+                request_identity = conn.execute(
+                    """SELECT requester_user_id, status, fulfilled_license_id
+                       FROM license_requests WHERE id=%s""",
+                    (request_id,),
+                ).fetchone()
+                if request_identity is None:
+                    raise NotFoundError("license request not found")
+                if request_identity["status"] == "fulfilled":
+                    existing = conn.execute(
+                        """SELECT id, serial, creation_request_hash, deleted_at FROM licenses
+                           WHERE id=%s""",
+                        (request_identity["fulfilled_license_id"],),
+                    ).fetchone()
+                    if (
+                        existing is not None
+                        and existing["deleted_at"] is None
+                        and existing["serial"] == params.serial
+                        and hmac.compare_digest(
+                            bytes(existing["creation_request_hash"] or b""),
+                            params.creation_request_hash,
+                        )
+                    ):
+                        return (
+                            self._license_request_by_id_conn(conn, request_id),
+                            self._license_by_id_conn(conn, existing["id"]),
+                            True,
+                        )
+                    raise ConflictError("license request was fulfilled with different data")
+                # Lock user -> request, matching user archival/deletion, which
+                # updates the user's open requests while holding the user row.
+                requester = conn.execute(
+                    """SELECT id FROM users WHERE id=%s AND role='customer' AND status='active'
+                       AND email_verified_at IS NOT NULL AND archived_at IS NULL
+                       AND deleted_at IS NULL FOR SHARE""",
+                    (request_identity["requester_user_id"],),
+                ).fetchone()
+                if requester is None:
+                    raise ConflictError("requesting customer is no longer eligible")
+                request_row = conn.execute(
+                    """SELECT requester_user_id, product_id, requested_activations,
+                              status, fulfilled_license_id
+                       FROM license_requests WHERE id=%s FOR UPDATE""",
+                    (request_id,),
+                ).fetchone()
+                if request_row is None:
+                    raise NotFoundError("license request not found")
+                if request_row["requester_user_id"] != request_identity["requester_user_id"]:
+                    raise ConflictError("license request owner changed")
+                if request_row["status"] == "fulfilled":
+                    existing = conn.execute(
+                        """SELECT id, serial, creation_request_hash, deleted_at FROM licenses
+                           WHERE id=%s""",
+                        (request_row["fulfilled_license_id"],),
+                    ).fetchone()
+                    if (
+                        existing is not None
+                        and existing["deleted_at"] is None
+                        and existing["serial"] == params.serial
+                        and hmac.compare_digest(
+                            bytes(existing["creation_request_hash"] or b""),
+                            params.creation_request_hash,
+                        )
+                    ):
+                        return (
+                            self._license_request_by_id_conn(conn, request_id),
+                            self._license_by_id_conn(conn, existing["id"]),
+                            True,
+                        )
+                    raise ConflictError("license request was fulfilled with different data")
+                if request_row["status"] not in {"pending", "approved"}:
+                    raise ConflictError("license request is no longer reviewable")
+                if params.product_id != request_row["product_id"]:
+                    raise InvalidError("approved license product does not match the request")
+                if params.max_activations < request_row["requested_activations"]:
+                    raise InvalidError("approved activation count is below the requested count")
+                product = conn.execute(
+                    "SELECT id FROM products WHERE id=%s AND status='active' FOR SHARE",
+                    (params.product_id,),
+                ).fetchone()
+                if product is None:
+                    raise ConflictError("requested product is no longer active")
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (str(params.serial),),
+                )
+                if (
+                    conn.execute(
+                        "SELECT id FROM licenses WHERE serial=%s FOR UPDATE", (params.serial,)
+                    ).fetchone()
+                    is not None
+                ):
+                    raise ConflictError("serial is already associated with a license")
+                conn.execute(
+                    """INSERT INTO licenses
+                       (id, serial, product_id, owner_user_id, source, issuer_key_id,
+                        import_artifact, import_artifact_hash, creation_request_hash,
+                        claim_code_hash, claim_code_suffix, claim_consumed_at, subject,
+                        issued_at, not_before, expires_at, max_activations,
+                        offline_grace_seconds, entitlements, metadata, created_by)
+                       VALUES (%s,%s,%s,%s,'online',NULL,NULL,NULL,%s,%s,%s,%s,%s,%s,
+                               %s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        params.id,
+                        params.serial,
+                        params.product_id,
+                        request_row["requester_user_id"],
+                        params.creation_request_hash,
+                        params.claim_code_hash,
+                        params.claim_code_suffix,
+                        now,
+                        params.subject,
+                        _utc(params.issued_at),
+                        _utc(params.not_before),
+                        _utc(params.expires_at) if params.expires_at else None,
+                        params.max_activations,
+                        params.offline_grace_seconds,
+                        Jsonb(params.entitlements),
+                        Jsonb(params.metadata),
+                        params.created_by,
+                    ),
+                )
+                conn.execute(
+                    """UPDATE license_requests SET status='fulfilled', admin_notes=%s,
+                              reviewed_by=%s, reviewed_at=%s, fulfilled_license_id=%s,
+                              updated_at=%s WHERE id=%s""",
+                    (admin_notes, params.created_by, now, params.id, now, request_id),
+                )
+                self._insert_audit(conn, replace(params.audit, target_id=str(params.id)))
+                self._insert_audit(
+                    conn,
+                    replace(
+                        audit,
+                        target_id=str(request_id),
+                        details={**audit.details, "licenseId": str(params.id)},
+                    ),
+                )
+                return (
+                    self._license_request_by_id_conn(conn, request_id),
+                    self._license_by_id_conn(conn, params.id),
+                    False,
+                )
+        except UniqueViolation as exc:
+            raise ConflictError("license identifiers already exist") from exc
+
     def list_licenses(self, filters: LicenseListFilter | None = None) -> list[License]:
         filters = filters or LicenseListFilter()
         self._validate_limit(filters.limit)
+        lifecycle_predicate = _lifecycle_predicate("l", filters.lifecycle)
         with self.pool.connection() as conn:
             rows = conn.execute(
                 LICENSE_SELECT
-                + """
+                + f"""
                 WHERE (%s::uuid IS NULL OR l.serial=%s)
                   AND (%s='' OR u.normalized_email=%s)
                   AND (%s='' OR l.claim_code_suffix=%s)
                   AND (%s='' OR p.code=%s)
                   AND (%s='' OR l.state=%s)
+                  AND {lifecycle_predicate}
                 ORDER BY l.created_at DESC, l.id DESC LIMIT %s
                 """,
                 (
@@ -1300,24 +2378,32 @@ class Store:
             ).fetchall()
         return [_license(row) for row in rows]
 
-    def license_by_id(self, license_id: UUID) -> License:
+    def license_by_id(self, license_id: UUID, *, include_deleted: bool = False) -> License:
+        lifecycle = "" if include_deleted else " AND l.deleted_at IS NULL"
         with self.pool.connection() as conn:
-            return self._license_by_id_conn(conn, license_id)
+            row = conn.execute(LICENSE_SELECT + f" WHERE l.id=%s{lifecycle}", (license_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("license not found")
+        return _license(row)
 
     def list_activations_for_owner(self, license_id: UUID, owner_id: UUID) -> list[Activation]:
         with self.pool.connection() as conn:
             exists = conn.execute(
-                "SELECT EXISTS(SELECT 1 FROM licenses WHERE id=%s AND owner_user_id=%s) AS exists",
+                """SELECT EXISTS(SELECT 1 FROM licenses WHERE id=%s AND owner_user_id=%s
+                          AND archived_at IS NULL AND deleted_at IS NULL) AS exists""",
                 (license_id, owner_id),
             ).fetchone()["exists"]
             if not exists:
                 raise NotFoundError("license not found")
             return self._list_activations_conn(conn, license_id)
 
-    def list_activations(self, license_id: UUID) -> list[Activation]:
+    def list_activations(self, license_id: UUID, *, include_deleted: bool = False) -> list[Activation]:
+        lifecycle = "" if include_deleted else " AND deleted_at IS NULL"
         with self.pool.connection() as conn:
             exists = conn.execute(
-                "SELECT EXISTS(SELECT 1 FROM licenses WHERE id=%s) AS exists", (license_id,)
+                f"""SELECT EXISTS(SELECT 1 FROM licenses WHERE id=%s
+                          {lifecycle}) AS exists""",
+                (license_id,),
             ).fetchone()["exists"]
             if not exists:
                 raise NotFoundError("license not found")
@@ -1354,6 +2440,7 @@ class Store:
                    JOIN products p ON p.id=l.product_id
                    LEFT JOIN users u ON u.id=l.owner_user_id
                    WHERE (%s::uuid IS NULL OR a.license_id=%s)
+                     AND l.deleted_at IS NULL
                      AND (%s::uuid IS NULL OR l.serial=%s)
                      AND (%s='' OR u.normalized_email=%s)
                      AND (%s='' OR p.code=%s)
@@ -1387,23 +2474,38 @@ class Store:
         with self.pool.connection() as conn:
             row = conn.execute(
                 """SELECT
-                    (SELECT count(*) FROM licenses) AS total_licenses,
-                    (SELECT count(*) FROM licenses WHERE state='active') AS active_licenses,
-                    (SELECT count(*) FROM licenses WHERE state='suspended') AS suspended_licenses,
-                    (SELECT count(*) FROM licenses WHERE state='revoked') AS revoked_licenses,
-                    (SELECT count(*) FROM licenses WHERE owner_user_id IS NOT NULL) AS claimed_licenses,
-                    (SELECT count(*) FROM licenses WHERE owner_user_id IS NULL) AS unclaimed_licenses,
-                    (SELECT count(*) FROM activations) AS total_activations,
-                    (SELECT count(*) FROM activations WHERE state='active') AS active_activations,
-                    (SELECT count(*) FROM activations WHERE state='deactivated') AS deactivated_activations,
-                    (SELECT count(*) FROM activations
-                       WHERE state='active' AND lease_expires_at>clock_timestamp()) AS current_leases,
+                    (SELECT count(*) FROM licenses WHERE archived_at IS NULL AND deleted_at IS NULL)
+                        AS total_licenses,
+                    (SELECT count(*) FROM licenses WHERE state='active'
+                       AND archived_at IS NULL AND deleted_at IS NULL) AS active_licenses,
+                    (SELECT count(*) FROM licenses WHERE state='suspended'
+                       AND archived_at IS NULL AND deleted_at IS NULL) AS suspended_licenses,
+                    (SELECT count(*) FROM licenses WHERE state='revoked'
+                       AND archived_at IS NULL AND deleted_at IS NULL) AS revoked_licenses,
+                    (SELECT count(*) FROM licenses WHERE owner_user_id IS NOT NULL
+                       AND archived_at IS NULL AND deleted_at IS NULL) AS claimed_licenses,
+                    (SELECT count(*) FROM licenses WHERE owner_user_id IS NULL
+                       AND archived_at IS NULL AND deleted_at IS NULL) AS unclaimed_licenses,
+                    (SELECT count(*) FROM activations a JOIN licenses l ON l.id=a.license_id
+                       WHERE l.archived_at IS NULL AND l.deleted_at IS NULL) AS total_activations,
+                    (SELECT count(*) FROM activations a JOIN licenses l ON l.id=a.license_id
+                       WHERE a.state='active' AND l.archived_at IS NULL
+                         AND l.deleted_at IS NULL) AS active_activations,
+                    (SELECT count(*) FROM activations a JOIN licenses l ON l.id=a.license_id
+                       WHERE a.state='deactivated' AND l.archived_at IS NULL
+                         AND l.deleted_at IS NULL) AS deactivated_activations,
+                    (SELECT count(*) FROM activations a JOIN licenses l ON l.id=a.license_id
+                       WHERE a.state='active' AND a.lease_expires_at>clock_timestamp()
+                         AND l.archived_at IS NULL AND l.deleted_at IS NULL) AS current_leases,
                     (SELECT count(*) FROM licenses
                        WHERE state='active' AND expires_at>clock_timestamp()
+                         AND archived_at IS NULL AND deleted_at IS NULL
                          AND expires_at<=clock_timestamp()+interval '30 days')
                         AS expiring_licenses_30_days,
-                    (SELECT count(*) FROM users) AS total_users,
-                    (SELECT count(*) FROM users WHERE status='active') AS active_users,
+                    (SELECT count(*) FROM users WHERE archived_at IS NULL AND deleted_at IS NULL)
+                        AS total_users,
+                    (SELECT count(*) FROM users WHERE status='active'
+                       AND archived_at IS NULL AND deleted_at IS NULL) AS active_users,
                     (SELECT count(*) FROM products) AS total_products,
                     (SELECT count(*) FROM products WHERE status='active') AS active_products"""
             ).fetchone()
@@ -1411,8 +2513,14 @@ class Store:
             raise RuntimeError("dashboard aggregate query returned no row")
         return DashboardSummary(**{name: int(row[name]) for name in DashboardSummary.__dataclass_fields__})
 
-    def deactivate_activation(self, activation_id: UUID, audit: AuditEvent) -> None:
+    def deactivate_activation(
+        self,
+        activation_id: UUID,
+        actor_user_id: UUID,
+        audit: AuditEvent,
+    ) -> None:
         with self.pool.connection() as conn, conn.transaction():
+            self._require_activation_manager(conn, actor_user_id)
             now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
             row = conn.execute(
                 """UPDATE activations SET state='deactivated', deactivated_at=%s, updated_at=%s
@@ -1458,7 +2566,8 @@ class Store:
         return [AuditRecord(**{name: row[name] for name in AuditRecord.__dataclass_fields__}) for row in rows]
 
     def cleanup_expired_security_state(self, now: datetime) -> None:
-        boundary = _utc(now) - timedelta(hours=24)
+        now = _utc(now)
+        boundary = now - timedelta(hours=24)
         tables = (
             ("activation_challenges", "expires_at"),
             ("email_verification_tokens", "expires_at"),
@@ -1480,11 +2589,75 @@ class Store:
                         )
                     if cursor.rowcount < CLEANUP_BATCH_SIZE:
                         break
+            pending_boundary = now - PENDING_REGISTRATION_RETENTION
+            while True:
+                with conn.transaction():
+                    cursor = conn.execute(
+                        """DELETE FROM users WHERE ctid IN (
+                               SELECT u.ctid FROM users u
+                               WHERE u.role='customer' AND u.email_verified_at IS NULL
+                                 AND u.password_set_at IS NULL AND u.updated_at<%s
+                                 AND u.archived_at IS NULL AND u.deleted_at IS NULL
+                                 AND NOT EXISTS (
+                                     SELECT 1 FROM licenses l WHERE l.owner_user_id=u.id
+                                 )
+                                 AND NOT EXISTS (
+                                     SELECT 1 FROM license_requests r
+                                     WHERE r.requester_user_id=u.id
+                                 )
+                               LIMIT %s
+                           )""",
+                        (pending_boundary, CLEANUP_BATCH_SIZE),
+                    )
+                if cursor.rowcount < CLEANUP_BATCH_SIZE:
+                    break
 
     @staticmethod
     def _validate_limit(limit: int) -> None:
         if not 1 <= limit <= 200:
             raise InvalidError("limit must be between 1 and 200")
+
+    @staticmethod
+    def _check_revision(current: int, expected: int | None) -> None:
+        if expected is not None and expected != current:
+            raise ConflictError("resource revision has changed")
+
+    @staticmethod
+    def _require_owner(conn: Connection, actor_user_id: UUID) -> None:
+        actor = conn.execute(
+            """SELECT role, status FROM users WHERE id=%s AND status='active'
+               AND archived_at IS NULL AND deleted_at IS NULL FOR SHARE""",
+            (actor_user_id,),
+        ).fetchone()
+        if actor is None or actor["role"] != Role.PLATFORM_OWNER.value:
+            raise UnauthorizedError("actor is not an active platform owner")
+
+    @staticmethod
+    def _require_license_writer(conn: Connection, actor_user_id: UUID) -> None:
+        actor = conn.execute(
+            """SELECT role, status FROM users WHERE id=%s AND status='active'
+               AND archived_at IS NULL AND deleted_at IS NULL FOR SHARE""",
+            (actor_user_id,),
+        ).fetchone()
+        if actor is None or actor["role"] not in {
+            Role.PLATFORM_OWNER.value,
+            Role.LICENSE_ADMIN.value,
+        }:
+            raise UnauthorizedError("actor cannot manage licenses")
+
+    @staticmethod
+    def _require_activation_manager(conn: Connection, actor_user_id: UUID) -> None:
+        actor = conn.execute(
+            """SELECT role, status FROM users WHERE id=%s AND status='active'
+               AND archived_at IS NULL AND deleted_at IS NULL FOR SHARE""",
+            (actor_user_id,),
+        ).fetchone()
+        if actor is None or actor["role"] not in {
+            Role.PLATFORM_OWNER.value,
+            Role.LICENSE_ADMIN.value,
+            Role.SUPPORT.value,
+        }:
+            raise UnauthorizedError("actor cannot manage activations")
 
     @staticmethod
     def _insert_audit(conn: Connection, event: AuditEvent) -> None:
@@ -1515,6 +2688,13 @@ class Store:
         return [_activation(row) for row in rows]
 
     @staticmethod
+    def _license_request_by_id_conn(conn: Connection, request_id: UUID) -> LicenseRequest:
+        row = conn.execute(LICENSE_REQUEST_SELECT + " WHERE r.id=%s", (request_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("license request not found")
+        return _license_request(row)
+
+    @staticmethod
     def _license_by_id_conn(conn: Connection, license_id: UUID) -> License:
         row = conn.execute(LICENSE_SELECT + " WHERE l.id=%s", (license_id,)).fetchone()
         if row is None:
@@ -1523,7 +2703,12 @@ class Store:
 
     @classmethod
     def _lock_license(cls, conn: Connection, license_id: UUID) -> License:
-        row = conn.execute(LICENSE_SELECT + " WHERE l.id=%s FOR UPDATE OF l", (license_id,)).fetchone()
+        row = conn.execute(
+            LICENSE_SELECT
+            + """ WHERE l.id=%s AND l.archived_at IS NULL
+                  AND l.deleted_at IS NULL FOR UPDATE OF l""",
+            (license_id,),
+        ).fetchone()
         if row is None:
             raise NotFoundError("license not found")
         return _license(row)
@@ -1531,7 +2716,9 @@ class Store:
     @classmethod
     def _lock_owned_license(cls, conn: Connection, license_id: UUID, owner_id: UUID) -> License:
         row = conn.execute(
-            LICENSE_SELECT + " WHERE l.id=%s AND l.owner_user_id=%s FOR UPDATE OF l",
+            LICENSE_SELECT
+            + """ WHERE l.id=%s AND l.owner_user_id=%s
+                  AND l.archived_at IS NULL AND l.deleted_at IS NULL FOR UPDATE OF l""",
             (license_id, owner_id),
         ).fetchone()
         if row is None:

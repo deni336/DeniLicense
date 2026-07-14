@@ -12,7 +12,11 @@ from denilicense import auth
 from denilicense.api import create_app
 from denilicense.config import Settings
 from denilicense.domain import ConflictError, Principal, Role, User
-from denilicense.store import CreateManagedUserParams, UpdateUserAccessParams
+from denilicense.store import (
+    CreateManagedUserParams,
+    ResendPasswordSetupParams,
+    UpdateUserAccessParams,
+)
 
 
 class RecordingPasswordManager:
@@ -42,6 +46,7 @@ class AdminStore:
             uuid4(),
         )
         self.created: CreateManagedUserParams | None = None
+        self.resent: ResendPasswordSetupParams | None = None
         self.updated: UpdateUserAccessParams | None = None
         self.fail_create = False
 
@@ -69,6 +74,19 @@ class AdminStore:
             params.status or "active",
             now,
             now,
+        )
+
+    def resend_password_setup(self, params: ResendPasswordSetupParams) -> User:
+        self.resent = params
+        now = datetime.now(UTC)
+        return User(
+            params.user_id,
+            "pending@example.com",
+            Role.LICENSE_ADMIN,
+            "active",
+            now,
+            now,
+            password_setup_required=True,
         )
 
 
@@ -170,6 +188,29 @@ def test_invitation_token_is_not_exposed_when_development_tokens_are_disabled() 
     assert len(store.created.password_reset_token_hash) == 32
 
 
+def test_owner_can_resend_a_fresh_pending_password_setup_invitation() -> None:
+    store = AdminStore()
+    app, _, config = service(store)
+    target_id = uuid4()
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/admin/users/{target_id}/invitation/resend",
+            headers=authorization(),
+        )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["user"]["passwordSetupRequired"] is True
+    assert payload["invitationDelivery"] == "manual"
+    token = payload["developmentPasswordResetToken"]
+    assert store.resent is not None
+    assert store.resent.user_id == target_id
+    assert store.resent.actor_user_id == store.principal.user.id
+    assert auth.hash_token(config.token_pepper, auth.PASSWORD_RESET_TOKEN, token) == (store.resent.token_hash)
+
+
 @pytest.mark.parametrize(
     "role",
     [Role.LICENSE_ADMIN, Role.SUPPORT, Role.AUDITOR, Role.CUSTOMER],
@@ -229,7 +270,7 @@ def test_atomic_access_endpoint_passes_actor_role_and_status_together() -> None:
     with TestClient(app) as client:
         response = client.post(
             f"/api/v1/admin/users/{target_id}/access",
-            json={"role": "support", "status": "disabled"},
+            json={"role": "support", "status": "disabled", "expectedRevision": 1},
             headers=authorization(),
         )
 
@@ -241,6 +282,7 @@ def test_atomic_access_endpoint_passes_actor_role_and_status_together() -> None:
     assert store.updated.actor_user_id == store.principal.user.id
     assert store.updated.role is Role.SUPPORT
     assert store.updated.status == "disabled"
+    assert store.updated.expected_revision == 1
 
 
 @pytest.mark.parametrize(

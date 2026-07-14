@@ -83,6 +83,12 @@ if claims.entitlements.get("feature.reporting") is True:
     enable_reporting()
 ```
 
+Entitlements are a typed, flat, signed snapshot. Missing or incorrectly typed
+values must fail closed, and unsigned configuration must never widen them. See
+[License entitlements](ENTITLEMENTS.md) for the exact name, type, and payload
+limits; UI, API, and offline issuance examples; safe boolean, integer, and enum
+consumption; revision handling; and schema-evolution guidance.
+
 Pin the service origin in application configuration. Retrieve the JWK set over authenticated HTTPS, apply normal response-size and timeout limits, and cache it according to policy. For installations that must verify while disconnected, ship or persist the expected public keys through a signed software update. Key-set retrieval is not a substitute for a trust anchor.
 
 ## Proof-of-possession renewal

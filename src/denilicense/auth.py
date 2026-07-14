@@ -113,7 +113,11 @@ class PasswordManager:
         return encoded.decode("ascii")
 
     def verify(self, encoded_hash: str, password: str) -> bool:
-        encoded = encoded_hash.encode("ascii", "strict")
+        try:
+            encoded = encoded_hash.encode("ascii", "strict")
+            password_bytes = password.encode("utf-8")
+        except UnicodeEncodeError, UnicodeDecodeError:
+            return False
         match = _PHC.fullmatch(encoded)
         if not match:
             return False
@@ -128,7 +132,7 @@ class PasswordManager:
             or not 1 <= parallelism <= 16
         ):
             return False
-        if len(password.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        if len(password_bytes) > PASSWORD_MAX_BYTES:
             return False
         try:
             with _ARGON_GATE:

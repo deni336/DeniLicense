@@ -23,6 +23,7 @@ def test_password_hash_and_verify_with_pepper() -> None:
     encoded = manager.hash("correct horse battery staple")
     assert manager.verify(encoded, "correct horse battery staple")
     assert not manager.verify(encoded, "incorrect horse battery staple")
+    assert not manager.verify(encoded, "invalid surrogate \ud800")
 
 
 def test_opaque_tokens_are_strict_and_domain_separated() -> None:

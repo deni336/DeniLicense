@@ -8,7 +8,7 @@ DeniLicense is not an OAuth or OpenID Connect implementation. Use those protocol
 
 - A Python 3.14 FastAPI service and network-free `denilic` issuer CLI.
 - PostgreSQL migrations and transactional license, claim, activation, renewal, user-management, and audit state.
-- Argon2id passwords, optional password peppering, opaque HMAC-indexed access tokens, and rotating refresh tokens with reuse-family revocation.
+- Argon2id passwords, optional password peppering, opaque HMAC-indexed access tokens, rotating refresh tokens with reuse-family revocation, and self-service password/session controls.
 - Non-enumerating registration, email verification, password-reset, and owner-managed invitation flows through a private email webhook.
 - Five server-enforced roles with visible effective-permission summaries; only a platform owner can manage users or register an offline issuer.
 - 160-bit Crockford Base32 claim codes. Only a domain-separated digest and four-character support suffix are stored.
@@ -16,7 +16,8 @@ DeniLicense is not an OAuth or OpenID Connect implementation. Use those protocol
 - Strict canonical `dlic1` offline grants and short-lived, device-bound `dllease1` activation leases.
 - Exact offline re-import idempotency, conflicting-serial rejection, and retry-safe online issuance with idempotency keys.
 - Transactional activation-seat enforcement and Ed25519 proof-of-possession renewal challenges.
-- A public JWK set, OpenAPI document, problem-detail responses, CORS allowlisting, security headers, request IDs, rate limits, and audit records.
+- Revision-safe product retirement/reactivation that hides retired products and blocks new issuance without invalidating existing licenses.
+- A public JWK set, bearer-aware OpenAPI document, problem-detail responses, CORS allowlisting, security headers, request IDs, rate limits, and audit records.
 - A verification-only Python client surface for product integrations.
 
 ## Trust model
@@ -71,6 +72,13 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8080/api/v1/admin/products `
 
 Compose deliberately uses predictable development secrets and an unencrypted database connection. Never deploy those settings.
 
+To connect another containerized application, attach that service to the
+existing `denilicense-network` bridge and use
+`http://denilicense-api:8080` as its DeniLicense base URL. Do not enable host
+networking or use `localhost` from inside the other container. The complete
+Compose example and lease-issuer note are in the
+[operations guide](docs/OPERATIONS.md#container-to-container-access).
+
 ## Python development
 
 Requirements: CPython 3.14 and PostgreSQL 17 for a locally served instance. Docker can provide PostgreSQL if desired.
@@ -79,8 +87,11 @@ Requirements: CPython 3.14 and PostgreSQL 17 for a locally served instance. Dock
 py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
 
-# Tests, formatting, lint, and dependency audit
+## Tests, formatting, lint, and dependency audit
+
+```powershell
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\ruff.exe format --check src tests
 .\.venv\Scripts\ruff.exe check src tests
@@ -155,14 +166,17 @@ An exact re-import returns the existing license. The same serial with different 
 
 ## Customer and installation flow
 
-1. Register with `POST /api/v1/auth/register`, then consume the emailed token at `POST /api/v1/auth/verify-email`. Development Compose returns the token in the response because it intentionally has no email webhook.
-2. Log in and submit the one-time code to `POST /api/v1/licenses/claim`.
+1. Choose **Create customer account** in the embedded UI (or call `POST /api/v1/auth/register`) and provide only the email address. The one-time verification link proves ownership and is where the customer chooses the account's first password; no caller-selected password is retained before verification. Development Compose displays the link because it intentionally has no email webhook.
+2. Log in and either submit a request from **License requests**, or claim an already-issued license with its one-time code. Owners and license administrators can review a request and issue a license directly to that customer without sending a claim secret.
 3. Generate a distinct Ed25519 installation keypair and keep its private key in the strongest OS keystore available.
 4. Approve the installation public key with `POST /api/v1/licenses/{licenseId}/activations`.
 5. Verify the returned lease with `denilicense.client` and the keys at `/.well-known/denilicense-activation-keys.json`, binding the configured issuer, product, and installation-key thumbprint.
 6. Before expiry, request `POST /api/v1/activation-challenges`, validate and sign its structured transcript, and complete it at `POST /api/v1/activation-challenges/complete`.
 
-See [client integration](docs/CLIENT_INTEGRATION.md) for Python imports and exact verification rules.
+See [the entitlement guide](docs/ENTITLEMENTS.md) for naming, types, issuance,
+safe feature and limit checks, schema evolution, offline behavior, and the
+hostile-client boundary. See [client integration](docs/CLIENT_INTEGRATION.md)
+for Python imports and exact verification rules.
 
 ## Administration and recovery
 
@@ -170,7 +184,13 @@ Customers can list their installations at `GET /api/v1/licenses/{licenseId}/acti
 
 Platform owners can add an account from **Users → Add user**, choose its role, and review the resulting permission bundle before creating it. The account receives a single-use password-setup invitation; the owner never chooses or sees the user's password. Development mode exposes the setup link for manual testing, while production queues it through the configured private email webhook.
 
-Privileged endpoints under `/api/v1/admin` support product and license issuance, issuer status, license state, administrative deactivation, user invitation and role/status management, and audit-event pagination. Role or status changes are atomic and revoke all of that user's sessions. A transaction rechecks the acting owner, prevents self-demotion or self-disablement, and refuses to remove the final active platform owner.
+Pending setup invitations can be resent from the user detail panel. Resending invalidates every older setup link. Archiving immediately disables and signs out the user; restoring an archived user leaves it disabled until an owner explicitly re-enables access. Permanent deletion requires an archived user and anonymizes the account while preserving audit and license references. It is blocked while the account owns a non-revoked license.
+
+Archiving a license suspends an active license, deactivates its current seats, and invalidates pending renewal challenges. Restoring it does not reactivate it. Permanent deletion requires the license to be both archived and revoked, and retains a cryptographic tombstone so its serial, claim digest, and issuance identity cannot be replayed. Destructive operations use the displayed revision to reject stale browser actions.
+
+Every signed-in user can open **Account security** to change their password, review active sessions, revoke one session, or revoke every session except the current one. A password change keeps the verified current session and revokes the rest.
+
+Privileged endpoints under `/api/v1/admin` support product and license issuance, product retirement/reactivation, issuer status, license state, administrative deactivation, user invitation and role/status management, and audit-event pagination. Product and user access changes require the displayed revision so stale consoles cannot silently overwrite newer decisions. Role or status changes are atomic and revoke all of that user's sessions. A transaction rechecks the acting owner, prevents self-demotion or self-disablement, and refuses to remove the final active platform owner.
 
 ## Production boundary
 

@@ -6,6 +6,7 @@
   <meta name="referrer" content="no-referrer">
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#102a43">
+  <link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
   <title>DeniLicense Console</title>
   <link rel="stylesheet" href="/ui/app.css">
 </head>
@@ -43,8 +44,35 @@
             <span class="button-spinner" aria-hidden="true"></span>
           </button>
         </form>
+        <button id="open-registration-button" class="button secondary wide registration-entry" type="button" hidden>Create a customer account</button>
         <button id="request-password-reset-button" class="text-button password-help" type="button">Forgot or need to set your password?</button>
+        <button id="resend-verification-button" class="text-button password-help" type="button">Resend verification email</button>
         <p class="login-footnote">Tokens remain in this browser tab and are removed when the tab closes.</p>
+      </div>
+    </section>
+  </main>
+
+  <main id="email-verification-screen" class="login-screen" aria-labelledby="email-verification-title" hidden>
+    <section class="login-brand" aria-label="DeniLicense">
+      <div class="brand-mark large" aria-hidden="true">DL</div>
+      <p class="eyebrow">Customer registration</p>
+      <h1>Confirm your email.<br>Request your license.</h1>
+      <p class="login-copy">Email verification protects your account before license requests and machine records become available.</p>
+      <div class="trust-list" aria-label="Account protections"><span>One-time verification</span><span>Private license inventory</span><span>Audited requests</span></div>
+    </section>
+    <section class="login-panel">
+      <div class="login-card">
+        <p class="eyebrow">Email verification</p>
+        <h2 id="email-verification-title">Finish account setup</h2>
+        <div id="email-verification-status" class="verification-status" role="status" aria-live="polite">Choose a password to verify your email and activate your customer account.</div>
+        <div id="email-verification-error" class="alert error" role="alert" hidden></div>
+        <form id="email-verification-form" class="stack-form">
+          <label>New password<input name="newPassword" type="password" autocomplete="new-password" minlength="15" maxlength="1024" required autofocus><small>Use at least 15 characters and a password unique to this service.</small></label>
+          <label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="15" maxlength="1024" required></label>
+          <button class="button primary wide" type="submit"><span class="button-label">Verify and activate account</span><span class="button-spinner" aria-hidden="true"></span></button>
+        </form>
+        <button id="email-verification-continue" class="button primary wide" type="button" hidden>Continue to sign in</button>
+        <p class="login-footnote">The verification token was removed from the address bar and is never stored by this console.</p>
       </div>
     </section>
   </main>
@@ -89,8 +117,9 @@
       <nav id="primary-nav" class="primary-nav">
         <button type="button" data-route="dashboard"><span aria-hidden="true">⌂</span>Overview</button>
         <button type="button" data-route="licenses"><span aria-hidden="true">◇</span>Licenses</button>
+        <button type="button" data-route="requests"><span aria-hidden="true">▤</span>License requests</button>
         <button type="button" data-route="machines" data-roles="platform_owner,license_admin,support,auditor"><span aria-hidden="true">▣</span>Machines</button>
-        <button type="button" data-route="products" data-roles="platform_owner,license_admin"><span aria-hidden="true">▦</span>Products</button>
+        <button type="button" data-route="products" data-roles="platform_owner,license_admin,support,auditor"><span aria-hidden="true">▦</span>Products</button>
         <button type="button" data-route="issuers" data-roles="platform_owner"><span aria-hidden="true">⌁</span>Issuers</button>
         <button type="button" data-route="users" data-roles="platform_owner"><span aria-hidden="true">◎</span>Users</button>
         <button type="button" data-route="audit" data-roles="platform_owner,auditor"><span aria-hidden="true">≡</span>Audit log</button>
@@ -114,6 +143,7 @@
             <span id="user-avatar" class="avatar" aria-hidden="true"></span>
             <span><strong id="user-email"></strong><small id="user-role"></small></span>
           </div>
+          <button id="account-security-button" class="button ghost" type="button" aria-label="Open account security">Security</button>
           <button id="logout-button" class="button ghost" type="button">Sign out</button>
         </div>
       </header>
@@ -146,16 +176,29 @@
           <div class="view-heading">
             <div><p class="eyebrow">Inventory</p><h2 id="licenses-heading">Licenses</h2><p class="muted">Find licenses, inspect machines, and manage lifecycle state.</p></div>
             <div id="license-actions" class="action-row">
+              <button id="claim-license-button" class="button primary" type="button" hidden>Claim a license</button>
               <button id="import-license-button" class="button secondary" type="button">Import offline license</button>
               <button id="create-license-button" class="button primary" type="button">Issue license</button>
             </div>
           </div>
+          <section id="license-lifecycle-console" class="lifecycle-console" aria-labelledby="license-lifecycle-heading">
+            <div class="lifecycle-copy">
+              <strong id="license-lifecycle-heading">License lifecycle</strong>
+              <span>Archive is reversible and stops operational use. Permanent deletion is owner-only and is available for revoked, archived licenses.</span>
+            </div>
+            <div class="lifecycle-tabs" role="group" aria-label="License lifecycle view">
+              <button class="lifecycle-tab active" type="button" data-lifecycle-form="license-filters" data-lifecycle-value="current">Current</button>
+              <button class="lifecycle-tab" type="button" data-lifecycle-form="license-filters" data-lifecycle-value="archived">Archived</button>
+              <button class="lifecycle-tab" type="button" data-lifecycle-form="license-filters" data-lifecycle-value="deleted" data-owner-only>Deleted</button>
+            </div>
+          </section>
           <form id="license-filters" class="filter-bar" aria-label="License filters">
             <label>Serial<input name="serial" type="search" placeholder="UUID" autocomplete="off"></label>
             <label>Owner email<input name="licenseOwnerSearch" data-api-param="ownerEmail" type="search" placeholder="owner@example.com" autocomplete="one-time-code"></label>
             <label>Claim suffix<input name="claimCodeSuffix" type="search" placeholder="AB12" maxlength="4" autocomplete="off"></label>
             <label>Product<select name="productCode"><option value="">All products</option></select></label>
             <label>State<select name="state"><option value="">All states</option><option value="active">Active</option><option value="suspended">Suspended</option><option value="revoked">Revoked</option></select></label>
+            <label>Lifecycle<select name="lifecycle"><option value="current">Current</option><option value="archived">Archived</option><option value="deleted">Deleted</option><option value="all">All records</option></select></label>
             <button class="button secondary" type="submit">Apply filters</button>
             <button id="clear-license-filters" class="text-button" type="button">Clear</button>
           </form>
@@ -166,9 +209,25 @@
           </div>
         </section>
 
+        <section id="view-requests" class="view" data-view="requests" aria-labelledby="requests-heading" hidden>
+          <div class="view-heading">
+            <div><p class="eyebrow">Fulfillment</p><h2 id="requests-heading">License requests</h2><p id="requests-description" class="muted">Review customer requests and issue licenses with explicit product entitlements.</p></div>
+            <button id="create-request-button" class="button primary" type="button" hidden>Request a license</button>
+          </div>
+          <form id="request-filters" class="filter-bar request-filter-bar" aria-label="License request filters">
+            <label>Status<select name="status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="fulfilled">Fulfilled</option><option value="denied">Denied</option><option value="cancelled">Cancelled</option></select></label>
+            <label>Customer email<input name="requesterEmail" type="search" placeholder="customer@example.com" autocomplete="one-time-code"></label>
+            <label>Product<select name="productCode"><option value="">All products</option></select></label>
+            <button class="button secondary" type="submit">Apply filters</button>
+            <button id="clear-request-filters" class="text-button" type="button">Clear</button>
+          </form>
+          <div id="requests-error" class="alert error" role="alert" hidden></div>
+          <div class="panel table-panel"><div id="request-result-summary" class="table-summary" aria-live="polite"></div><div id="requests-table" class="table-wrap"></div></div>
+        </section>
+
         <section id="view-products" class="view" data-view="products" aria-labelledby="products-heading" hidden>
           <div class="view-heading">
-            <div><p class="eyebrow">Catalog</p><h2 id="products-heading">Products</h2><p class="muted">Products define the audience for issued and imported licenses.</p></div>
+            <div><p class="eyebrow">Catalog</p><h2 id="products-heading">Products</h2><p class="muted">Review product lifecycle status. Retired products remain valid for existing licenses but are unavailable for new issuance.</p></div>
             <button id="create-product-button" class="button primary" type="button">New product</button>
           </div>
           <div id="products-error" class="alert error" role="alert" hidden></div>
@@ -218,6 +277,7 @@
               <form id="issuer-status-form" class="stack-form">
                 <label>Key ID<input name="keyId" required minlength="43" maxlength="43" spellcheck="false"></label>
                 <label>Status<select name="status"><option value="active">Active</option><option value="retired">Retired</option><option value="revoked">Revoked</option></select></label>
+                <p id="issuer-status-guidance" class="lifecycle-guidance" aria-live="polite" hidden></p>
                 <button class="button danger-outline" type="submit">Update status</button>
               </form>
               <div id="issuer-result" class="result-card" hidden></div>
@@ -234,8 +294,20 @@
             <div class="panel-heading"><div><h3 id="access-guide-heading">Permission bundles</h3><p class="muted">Permissions are managed through roles so each account receives a consistent, reviewable access policy.</p></div></div>
             <div id="role-guide" class="role-guide" aria-label="Role permission summary"></div>
           </section>
-          <form id="user-search" class="filter-bar compact" aria-label="User search">
+          <section class="lifecycle-console" aria-labelledby="user-lifecycle-heading">
+            <div class="lifecycle-copy">
+              <strong id="user-lifecycle-heading">User lifecycle</strong>
+              <span>Resend pending invitations or archive accounts directly below. Open Archived to restore or permanently delete an account.</span>
+            </div>
+            <div class="lifecycle-tabs" role="group" aria-label="User lifecycle view">
+              <button class="lifecycle-tab active" type="button" data-lifecycle-form="user-search" data-lifecycle-value="current">Current</button>
+              <button class="lifecycle-tab" type="button" data-lifecycle-form="user-search" data-lifecycle-value="archived">Archived</button>
+              <button class="lifecycle-tab" type="button" data-lifecycle-form="user-search" data-lifecycle-value="deleted">Deleted</button>
+            </div>
+          </section>
+          <form id="user-search" class="filter-bar compact user-filter-bar" aria-label="User search">
             <label>Email<input name="userEmailSearch" type="search" placeholder="Search exact email" autocomplete="one-time-code"></label>
+            <label>Lifecycle<select name="lifecycle"><option value="current">Current</option><option value="archived">Archived</option><option value="deleted">Deleted</option><option value="all">All records</option></select></label>
             <button class="button secondary" type="submit">Search</button>
             <button id="clear-user-search" class="text-button" type="button">Clear</button>
           </form>
@@ -269,9 +341,9 @@
     <div id="drawer-body" class="drawer-body"></div>
   </aside>
 
-  <dialog id="license-dialog" class="modal">
+  <dialog id="license-dialog" class="modal" aria-labelledby="license-dialog-title">
     <form id="license-form" class="modal-card">
-      <header class="modal-header"><div><p class="eyebrow">Online issuance</p><h2>Issue a license</h2></div><button class="icon-button" type="button" data-close-dialog="license-dialog" aria-label="Close">×</button></header>
+      <header class="modal-header"><div><p class="eyebrow">Online issuance</p><h2 id="license-dialog-title">Issue a license</h2></div><button class="icon-button" type="button" data-close-dialog="license-dialog" aria-label="Close">×</button></header>
       <div class="modal-body stack-form">
         <div id="license-form-error" class="alert error" role="alert" hidden></div>
         <div class="form-grid">
@@ -283,16 +355,84 @@
           <label>Expires at<input name="expiresAt" type="datetime-local"></label>
         </div>
         <label class="check-row"><input name="perpetual" type="checkbox"> Perpetual license (no expiration)</label>
-        <label>Entitlements (JSON object)<textarea name="entitlements" rows="7" spellcheck="false">{}</textarea><small>Values may be text, integers, or true/false.</small></label>
+        <label>Entitlements (JSON object)<textarea name="entitlements" rows="7" spellcheck="false">{}</textarea><small>Examples: <code>"feature.analytics": true</code>, <code>"limits.projects": 25</code>, or <code>"plan": "professional"</code>. Missing keys should be treated as disabled.</small></label>
+        <button id="entitlements-help-button" class="text-button inline-action" type="button">How entitlements control software features</button>
         <label>Idempotency key<input name="idempotencyKey" minlength="8" maxlength="128" spellcheck="false"><small>Reuse this key with the exact same request to recover a claim code safely.</small></label>
       </div>
       <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="license-dialog">Cancel</button><button class="button primary" type="submit">Issue license</button></footer>
     </form>
   </dialog>
 
-  <dialog id="import-dialog" class="modal">
+  <dialog id="registration-dialog" class="modal small" aria-labelledby="registration-title">
+    <form id="registration-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Customer access</p><h2 id="registration-title">Create an account</h2></div><button class="icon-button" type="button" data-close-dialog="registration-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form">
+        <div id="registration-entry">
+          <div id="registration-error" class="alert error" role="alert" hidden></div>
+          <p class="muted">Enter your email address. The verification link lets you choose a password and activate your customer account.</p>
+          <div class="stack-form registration-fields">
+            <label>Email address<input name="registrationEmail" type="email" required maxlength="254" autocomplete="email"></label>
+          </div>
+        </div>
+        <div id="registration-complete" hidden>
+          <h3>Check your email</h3>
+          <p id="registration-result-message" class="muted"></p>
+          <div id="development-verification-fields" class="stack-form" hidden>
+            <label>Development verification link<output id="development-verification-link" class="token-output"></output></label>
+            <button id="copy-verification-link" class="button secondary wide" type="button">Copy verification link</button>
+            <p class="alert warning">This one-time link is exposed only in development. Do not share it beyond the account owner.</p>
+          </div>
+        </div>
+      </div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="registration-dialog">Close</button><button id="registration-submit" class="button primary" type="submit">Create account</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="license-request-dialog" class="modal" aria-labelledby="license-request-title">
+    <form id="license-request-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Customer request</p><h2 id="license-request-title">Request a license</h2></div><button class="icon-button" type="button" data-close-dialog="license-request-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form">
+        <div id="license-request-form-error" class="alert error" role="alert" hidden></div>
+        <p class="muted">Tell the licensing team which product you need and how many machines must be activated. Approval may include product-specific entitlements.</p>
+        <div class="form-grid"><label>Product<select name="productCode" required></select></label><label>Machine seats<input name="requestedActivations" type="number" required min="1" max="100000" value="1"></label></div>
+        <label>Request details<textarea name="message" maxlength="2000" rows="6" placeholder="Describe your use case, order number, team, or features you need."></textarea><small>Do not include passwords, keys, or payment information.</small></label>
+      </div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="license-request-dialog">Cancel</button><button class="button primary" type="submit">Submit request</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="claim-license-dialog" class="modal small" aria-labelledby="claim-license-title">
+    <form id="claim-license-form" class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Existing license</p><h2 id="claim-license-title">Claim a license</h2></div><button class="icon-button" type="button" data-close-dialog="claim-license-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body stack-form"><div id="claim-license-error" class="alert error" role="alert" hidden></div><p class="muted">Enter the complete claim code supplied by your licensing administrator. Claim codes are one-time secrets and are case-sensitive.</p><label>Claim code<input name="claimCode" required minlength="1" maxlength="128" autocomplete="off" spellcheck="false" class="mono"></label></div>
+      <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="claim-license-dialog">Cancel</button><button class="button primary" type="submit">Claim license</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="entitlements-guide-dialog" class="modal" aria-labelledby="entitlements-guide-title">
+    <div class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">Integration guide</p><h2 id="entitlements-guide-title">Designing entitlements</h2></div><button class="icon-button" type="button" data-close-dialog="entitlements-guide-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body guide-content">
+        <p>Entitlements are signed license claims that your software reads after it validates the license or activation lease. Use stable names and deny access when a key is absent, malformed, or false.</p>
+        <h3>Choose a value by behavior</h3>
+        <dl class="guide-grid"><div><dt>Boolean</dt><dd>Turn a feature on or off: <code>"feature.analytics": true</code></dd></div><div><dt>Integer</dt><dd>Set a count or quota: <code>"limits.projects": 25</code></dd></div><div><dt>String</dt><dd>Select a named tier or mode: <code>"plan": "professional"</code></dd></div></dl>
+        <h3>Example</h3>
+        <pre class="code-sample"><code>{
+  "feature.analytics": true,
+  "feature.export.pdf": false,
+  "limits.projects": 25,
+  "plan": "professional"
+}</code></pre>
+        <p class="security-note"><strong>Fail closed</strong><span>Validate the signed license first. For every entitlement, enforce the expected type and a safe range. Treat missing, unknown, or invalid values as disabled; never trust client-edited JSON.</span></p>
+        <p class="muted"><a href="/docs/entitlements" target="_blank" rel="noopener">Open the complete entitlement integration and rollout guide</a> for Python examples, caching rules, migrations, tests, and security guidance.</p>
+      </div>
+      <footer class="modal-footer"><button class="button primary" type="button" data-close-dialog="entitlements-guide-dialog">Done</button></footer>
+    </div>
+  </dialog>
+
+  <dialog id="import-dialog" class="modal" aria-labelledby="import-dialog-title">
     <form id="import-form" class="modal-card">
-      <header class="modal-header"><div><p class="eyebrow">Offline workflow</p><h2>Import license artifact</h2></div><button class="icon-button" type="button" data-close-dialog="import-dialog" aria-label="Close">×</button></header>
+      <header class="modal-header"><div><p class="eyebrow">Offline workflow</p><h2 id="import-dialog-title">Import license artifact</h2></div><button class="icon-button" type="button" data-close-dialog="import-dialog" aria-label="Close">×</button></header>
       <div class="modal-body stack-form">
         <div id="import-form-error" class="alert error" role="alert" hidden></div>
         <p class="muted">The artifact signature, issuer trust, time bounds, product, and claim digest are verified before import.</p>
@@ -302,9 +442,9 @@
     </form>
   </dialog>
 
-  <dialog id="product-dialog" class="modal small">
+  <dialog id="product-dialog" class="modal small" aria-labelledby="product-dialog-title">
     <form id="product-form" class="modal-card">
-      <header class="modal-header"><div><p class="eyebrow">Catalog</p><h2>Create product</h2></div><button class="icon-button" type="button" data-close-dialog="product-dialog" aria-label="Close">×</button></header>
+      <header class="modal-header"><div><p class="eyebrow">Catalog</p><h2 id="product-dialog-title">Create product</h2></div><button class="icon-button" type="button" data-close-dialog="product-dialog" aria-label="Close">×</button></header>
       <div class="modal-body stack-form"><div id="product-form-error" class="alert error" role="alert" hidden></div><label>Code<input name="code" required minlength="2" maxlength="64" placeholder="DESKTOP_PRO"></label><label>Name<input name="name" required maxlength="120"></label><label>Description<textarea name="description" maxlength="2000" rows="4"></textarea></label></div>
       <footer class="modal-footer"><button class="button ghost" type="button" data-close-dialog="product-dialog">Cancel</button><button class="button primary" type="submit">Create product</button></footer>
     </form>
@@ -352,17 +492,45 @@
     </div>
   </dialog>
 
-  <dialog id="claim-dialog" class="modal small">
+  <dialog id="account-security-dialog" class="modal" aria-labelledby="account-security-title">
     <div class="modal-card">
-      <header class="modal-header"><div><p class="eyebrow">License issued</p><h2>Save this claim code</h2></div><button class="icon-button" type="button" data-close-dialog="claim-dialog" aria-label="Close">×</button></header>
+      <header class="modal-header"><div><p class="eyebrow">Account protection</p><h2 id="account-security-title">Account security</h2></div><button class="icon-button" type="button" data-close-dialog="account-security-dialog" aria-label="Close">×</button></header>
+      <div class="modal-body account-security-body">
+        <section class="security-section" aria-labelledby="change-password-title">
+          <div class="security-section-heading"><div><h3 id="change-password-title">Change password</h3><p class="muted">Use a unique password. A successful change signs out every other session.</p></div></div>
+          <div id="account-password-status" class="alert success" role="status" aria-live="polite" hidden></div>
+          <div id="account-password-error" class="alert error" role="alert" hidden></div>
+          <form id="account-password-form" class="stack-form">
+            <label>Current password<input name="currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label>
+            <label>New password<input name="newPassword" type="password" autocomplete="new-password" minlength="15" maxlength="1024" required><small>Use at least 15 characters and do not reuse the current password.</small></label>
+            <label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="15" maxlength="1024" required></label>
+            <button class="button primary" type="submit"><span class="button-label">Change password</span><span class="button-spinner" aria-hidden="true"></span></button>
+          </form>
+        </section>
+        <section class="security-section" aria-labelledby="active-sessions-title">
+          <div class="security-section-heading">
+            <div><h3 id="active-sessions-title">Active sessions</h3><p class="muted">Review access-token activity and revoke sessions you no longer recognize.</p></div>
+            <div class="action-row"><button id="refresh-account-sessions" class="button secondary" type="button">Refresh</button><button id="revoke-other-sessions" class="button danger-outline" type="button">Revoke other sessions</button></div>
+          </div>
+          <div id="account-sessions-error" class="alert error" role="alert" hidden></div>
+          <div id="account-sessions" class="session-list" aria-live="polite"></div>
+        </section>
+      </div>
+      <footer class="modal-footer"><button class="button primary" type="button" data-close-dialog="account-security-dialog">Done</button></footer>
+    </div>
+  </dialog>
+
+  <dialog id="claim-dialog" class="modal small" aria-labelledby="claim-result-title">
+    <div class="modal-card">
+      <header class="modal-header"><div><p class="eyebrow">License issued</p><h2 id="claim-result-title">Save this claim code</h2></div><button class="icon-button" type="button" data-close-dialog="claim-dialog" aria-label="Close">×</button></header>
       <div class="modal-body"><p class="muted">This code is shown only at issuance. Store it securely and deliver it to the customer.</p><output id="claim-code" class="secret-output"></output><button id="copy-claim-code" class="button secondary wide" type="button">Copy claim code</button><p id="claim-warning" class="alert warning"></p></div>
       <footer class="modal-footer"><button class="button primary" type="button" data-close-dialog="claim-dialog">I saved the code</button></footer>
     </div>
   </dialog>
 
-  <dialog id="confirm-dialog" class="confirm-modal">
+  <dialog id="confirm-dialog" class="confirm-modal" aria-labelledby="confirm-title" aria-describedby="confirm-message">
     <form method="dialog" class="modal-card">
-      <div class="modal-body"><div class="confirm-icon" aria-hidden="true">!</div><h2 id="confirm-title">Confirm action</h2><p id="confirm-message" class="muted"></p></div>
+      <div class="modal-body"><div class="confirm-icon" aria-hidden="true">!</div><h2 id="confirm-title">Confirm action</h2><p id="confirm-message" class="muted"></p><label id="confirm-typed-group" hidden><span id="confirm-typed-label">Type the record identifier to confirm</span><input id="confirm-typed-input" type="text" autocomplete="off" spellcheck="false"></label></div>
       <footer class="modal-footer"><button value="cancel" class="button ghost">Cancel</button><button id="confirm-accept" value="confirm" class="button danger">Confirm</button></footer>
     </form>
   </dialog>
