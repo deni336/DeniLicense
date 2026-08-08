@@ -12,7 +12,7 @@ license = "MIT"
 authors = [{name = "deni336"}]
 dependencies = [
   "argon2-cffi==25.1.0",
-  "cryptography==49.0.0",
+  "cryptography==50.0.0",
   "fastapi==0.139.0",
   "httpx==0.28.1",
   "psycopg[binary,pool]==3.3.4",
